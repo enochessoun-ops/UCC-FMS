@@ -247,9 +247,25 @@ function api_approvals_submit(): void {
     if ($module === '' || $rec === '') err('module and record_id are required');
     $ex = db()->prepare("SELECT id FROM approvals WHERE module=? AND record_id=?"); $ex->execute([$module, $rec]); $aid = $ex->fetchColumn();
     if (!$aid) {
+        // Tag the approval with the owning unit's code so routing/visibility can be
+        // tree-aware (a unit head reviews their own unit's documents). Prefer an
+        // explicit unit_code; else resolve the source record's unit_id -> code.
+        $unitCode = (string)($d['unit_code'] ?? '');
+        if ($unitCode === '') {
+            $tbl = ['actuals' => 'actuals', 'pv' => 'actuals', 'payment' => 'actuals', 'jv' => 'journal_vouchers',
+                'journal' => 'journal_vouchers', 'journal_vouchers' => 'journal_vouchers', 'commitment' => 'commitments',
+                'commitments' => 'commitments', 'receipt' => 'fund_receipts', 'fund_receipts' => 'fund_receipts'][strtolower($module)] ?? null;
+            if ($tbl) { try { $q = db()->prepare("SELECT o.code FROM $tbl x JOIN org_units o ON o.id=x.unit_id WHERE x.id=?"); $q->execute([$rec]); $unitCode = (string)($q->fetchColumn() ?: ''); } catch (Throwable $e) {} }
+        }
         $aid = uuid4();
-        db()->prepare("INSERT INTO approvals(id,module,record_id,amount_ghs,status,submitted_by) VALUES(?,?,?,?,'Pending',?)")
-            ->execute([$aid, $module, $rec, round((float)($d['amount_ghs'] ?? 0), 2), $u['username']]);
+        $hasUC = false; try { $hasUC = (bool)db()->query("SELECT 1 FROM pragma_table_info('approvals') WHERE name='unit_code'")->fetchColumn(); } catch (Throwable $e) {}
+        if ($hasUC) {
+            db()->prepare("INSERT INTO approvals(id,module,record_id,amount_ghs,unit_code,status,submitted_by) VALUES(?,?,?,?,?,'Pending',?)")
+                ->execute([$aid, $module, $rec, round((float)($d['amount_ghs'] ?? 0), 2), ($unitCode ?: null), $u['username']]);
+        } else {
+            db()->prepare("INSERT INTO approvals(id,module,record_id,amount_ghs,status,submitted_by) VALUES(?,?,?,?,'Pending',?)")
+                ->execute([$aid, $module, $rec, round((float)($d['amount_ghs'] ?? 0), 2), $u['username']]);
+        }
     }
     $sq = db()->prepare("SELECT id FROM approval_steps WHERE approval_id=?"); $sq->execute([$aid]);
     $sid = $sq->fetchColumn();
