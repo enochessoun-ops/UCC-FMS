@@ -1978,12 +1978,23 @@ function api_withholding_settle(): void {
     $st = db()->prepare('SELECT * FROM withholding_payables WHERE id=?'); $st->execute([$id]); $w = $st->fetch();
     if (!$w) err('Withholding payable not found');
     if (in_array(strtolower((string)$w['status']), ['settled', 'paid', 'remitted'], true)) err('Already settled');
-    $bank = operating_bank_coa(); if (!$bank) err('Bank account could not be resolved');
+    $bank = bank_coa_from_account((string)($d['bank_account_id'] ?? '')); if (!$bank) err('Bank account could not be resolved');
     $amt = round((float)$w['amount_ghs'], 2);
-    $lines = [['coa_id' => $w['coa_id'], 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => 'Remit ' . $w['payable_label']],
-              ['coa_id' => $bank['id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Payment to ' . $w['beneficiary']]];
+    // Self-describing remittance narration: "<rate>% WHT - <payee> - <purpose> (source <PV>)".
+    $payee = (string)($w['beneficiary'] ?? ''); $rate_pct = '';
+    if (!empty($w['actual_id'])) {
+        $oa = db()->prepare('SELECT payee, wht_rate FROM actuals WHERE id=?'); $oa->execute([$w['actual_id']]); $orig = $oa->fetch();
+        if ($orig) {
+            if (!empty($orig['payee'])) $payee = (string)$orig['payee'];
+            if (!empty($orig['wht_rate'])) $rate_pct = rtrim(rtrim(sprintf('%.2f', (float)$orig['wht_rate'] * 100), '0'), '.');
+        }
+    }
+    $head = ((string)$w['payable_type'] === 'WHT') ? (($rate_pct !== '' ? $rate_pct . '% ' : '') . 'WHT') : (string)$w['payable_label'];
+    $desc = $head . ' - ' . $payee . ' - remittance to ' . (string)($w['beneficiary'] ?? 'authority') . ' (source ' . (string)($w['source_pv_number'] ?? '') . ')';
+    $lines = [['coa_id' => $w['coa_id'], 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => $desc],
+              ['coa_id' => $bank, 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Payment to ' . (string)($w['beneficiary'] ?? '')]];
     $date = substr((string)($d['payment_date'] ?? date('Y-m-d')), 0, 10);
-    try { [$jid, $jvnum] = post_journal($u, 'PV', $date, substr($date, 0, 7), 'Withholding remittance: ' . $w['payable_label'], $lines, 'withholding_settlement', $id, resolve_write_unit($u, $d)); }
+    try { [$jid, $jvnum] = post_journal($u, 'PV', $date, substr($date, 0, 7), $desc, $lines, 'withholding_settlement', $id, resolve_write_unit($u, $d)); }
     catch (Throwable $e) { err('Settlement posting failed: ' . $e->getMessage()); }
     // 'Paid' satisfies the table's status CHECK and the suite's "settled" filter.
     db()->prepare("UPDATE withholding_payables SET status='Paid', settled_jv=? WHERE id=?")->execute([$jvnum, $id]);
@@ -2182,6 +2193,22 @@ function api_redate_reversal(): void {
     ok(['jv_number' => $jvn, 'new_date' => $new_date, 'new_period' => $new_period, 'ledger_lines_moved' => $moved]);
 }
 
+// ── Tax schedules: per control-account accrued / remitted / outstanding ────────
+function api_tax_schedules(): void {
+    require_auth(); ensure_wh_table();
+    $rows = db()->query("SELECT c.code AS code, MAX(c.account_name) AS name,
+        COALESCE(SUM(w.amount_ghs),0) AS accrued,
+        COALESCE(SUM(CASE WHEN LOWER(w.status) IN ('paid','settled','remitted') THEN w.amount_ghs ELSE 0 END),0) AS remitted
+        FROM withholding_payables w JOIN chart_of_accounts c ON c.id=w.coa_id GROUP BY c.code ORDER BY c.code")->fetchAll();
+    $summary = [];
+    foreach ($rows as $r) {
+        $acc = round((float)$r['accrued'], 2); $rem = round((float)$r['remitted'], 2);
+        $summary[] = ['code' => $r['code'], 'name' => $r['name'], 'opening' => 0.0, 'accrued' => $acc,
+                      'remitted' => $rem, 'adjustments' => 0.0, 'outstanding' => round($acc - $rem, 2)];
+    }
+    ok(['summary' => $summary, 'taxes' => $summary]);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -2233,6 +2260,7 @@ try {
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
+    if ($path === '/api/tax-schedules' && $method === 'GET') api_tax_schedules();
     if ($path === '/api/journals/redate' && $method === 'POST') api_redate_reversal();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
