@@ -26808,6 +26808,9 @@ body.dark-mode .md select, body.dark-mode .md textarea {
     try{
       var v=await window.GET('/api/vendors'), b=await window.GET('/api/bank-accounts'), p=await window.GET('/api/projects'), c=await window.GET('/api/coa');
       DATA.vendors=Array.isArray(v)?v:[]; DATA.banks=Array.isArray(b)?b:[]; DATA.projects=Array.isArray(p)?p:[];
+      // Org-unit tree for the cost-centre picker (so the multi-line PV attributes to a unit
+      // like the single PV / commitment, instead of silently defaulting to Central root).
+      try{ var ou=await window.GET('/api/org-units'); if(window.S){window.S.cache=window.S.cache||{}; window.S.cache.orgUnits=ou;} }catch(e){}
       // All COA a payment can debit: assets (1, e.g. PP&E / advances), liabilities (2,
       // settlements), and expenses (5/6). Excludes equity (3) and income (4).
       DATA.coa=(Array.isArray(c)?c:[]).filter(function(x){var cd=String(x.code||x.coa_code||'');return ['1','2','5','6'].indexOf(cd.charAt(0))>=0;});
@@ -26824,6 +26827,7 @@ body.dark-mode .md select, body.dark-mode .md textarea {
       +'<div><label>Payment Date <span style="color:#dc2626">*</span></label><input type="date" id="ml-date" class="fi" value="'+today+'"></div>'
       +'<div><label>Method</label><select id="ml-method" class="fi"><option>Cheque</option><option>Bank Transfer</option><option>Cash</option></select></div>'
       +'<div><label>Payment Reference</label><input id="ml-ref" class="fi" placeholder="Cheque / transfer ref"></div>'
+      +'<div><label>Unit / Cost Centre <span style="color:#dc2626">*</span></label><select id="ml-orgunit" class="fi">'+(typeof _jvUnitOptions==='function'?_jvUnitOptions(''):'')+'</select></div>'
       +'<div><label>Description</label><input id="ml-desc" class="fi" placeholder="Overall narration"></div>'
       +'</div>'
       +'<div style="margin:14px 0 6px;font-weight:800;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#334155">Payment Items <span style="font-weight:500;text-transform:none;color:#64748b">— tick VAT / WHVAT / UCF or pick a WHT type per line as needed</span></div>'
@@ -26834,14 +26838,16 @@ body.dark-mode .md select, body.dark-mode .md textarea {
       +'<div style="font-weight:800">Total: GHS <span id="ml-total">0.00</span></div></div>';
     window.showModal('Multi-line Payment Voucher', body, async function(){
       var payee=(E('ml-payee').value||'').trim(), bank=E('ml-bank').value, date=E('ml-date').value, method=E('ml-method').value, ref=(E('ml-ref').value||'').trim(), desc=(E('ml-desc').value||'').trim();
+      var unit=(E('ml-orgunit')&&E('ml-orgunit').value)||'';
       if(!payee){window.toast('Select a payee','error');return;}
       if(!bank){window.toast('Select the paying bank','error');return;}
+      if(typeof _requireUnit==='function' && !_requireUnit(unit)){return;}
       if(method!=='Cash' && !ref){window.toast(method+' needs a payment reference','error');return;}
       var lines=window.__mlCollect();
       if(!lines.length){window.toast('Add at least one payment line','error');return;}
       for(var i=0;i<lines.length;i++){ if(!lines[i].coa_id){window.toast('Line '+(i+1)+': pick a COA item','error');return;} if(!(lines[i].amount_ghs>0)){window.toast('Line '+(i+1)+': enter an amount','error');return;} }
       var btn=E('ms-btn'); if(btn){btn.disabled=true;btn.textContent='Saving…';}
-      var r=await window.POST('/api/actuals/multiline',{payee:payee,bank_account_id:bank,expense_date:date,payment_method:method,payment_reference:ref,receipt_no:ref,cheque_no:ref,transfer_ref:ref,description:desc,lines:lines});
+      var r=await window.POST('/api/actuals/multiline',{payee:payee,bank_account_id:bank,expense_date:date,payment_method:method,payment_reference:ref,receipt_no:ref,cheque_no:ref,transfer_ref:ref,description:desc,unit_id:unit,lines:lines});
       if(r&&r.ok){
         window.closeModal();
         if(confirm('✅ '+(r.actual_code||'Multi-line PV')+' saved ('+r.lines+' lines, GHS '+money(r.total_ghs)+').\n\nPost it to the ledger now?')){

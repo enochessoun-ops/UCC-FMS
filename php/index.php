@@ -387,17 +387,14 @@ function default_unit_id(): ?string {
 // home unit resolves to NULL, so the write path can hard-require a unit; Admin and
 // system/university posters always resolve to Central and are never blocked.
 function resolve_write_unit(array $user, ?array $d = null): ?string {
-    $explicit = $d['unit_id'] ?? null;
-    // Honour a unit *code* (or an id passed in the code field) — the SPA posting forms
-    // send unit_code/unit, and without this admin-entered transactions silently fell back
-    // to the Central root, mis-tagging every per-unit/segment report.
-    if (!$explicit) {
-        $codeval = $d['unit_code'] ?? ($d['unit'] ?? null);
-        if (!empty($codeval)) {
-            try { $st = db()->prepare('SELECT id FROM org_units WHERE id=? OR code=? LIMIT 1'); $st->execute([$codeval, $codeval]); $rid = $st->fetchColumn(); if ($rid) $explicit = $rid; } catch (Throwable $e) {}
-        }
+    // Accept the unit from any field (unit_id / unit_code / unit) and normalise it via an
+    // id-OR-code lookup — so a code accidentally placed in unit_id still resolves, and
+    // admin/SPA posts never silently fall back to the Central root and mis-tag reports.
+    $explicit = $d['unit_id'] ?? ($d['unit_code'] ?? ($d['unit'] ?? null));
+    if (!empty($explicit)) {
+        try { $st = db()->prepare('SELECT id FROM org_units WHERE id=? OR code=? LIMIT 1'); $st->execute([$explicit, $explicit]); $rid = $st->fetchColumn(); if ($rid) return $rid; } catch (Throwable $e) {}
+        // Unrecognised value: fall through to the creator's home unit / default.
     }
-    if ($explicit) return $explicit;
     $home = null; $scope = null;
     try {
         $st = db()->prepare('SELECT home_unit_id, scope FROM users WHERE username=?');
@@ -1254,18 +1251,23 @@ function api_save_multiline_actual(): void {
     }
     require_write_unit($u, $d, 'payment voucher');
     $unit = resolve_write_unit($u, $d);
+    // actuals.project_id is NOT NULL — derive a header project from the lines and require
+    // at least one, so the insert can't crash with a raw SQL error (mirror single-PV).
+    $hdrProj = $d['project_id'] ?? null;
+    if (empty($hdrProj)) { foreach ($norm as $nn) { if (!empty($nn['project_id'])) { $hdrProj = $nn['project_id']; break; } } }
+    if (empty($hdrProj)) err('Select a project / grant for at least one line (a payment voucher must be charged to a project).');
     if ($editRow) {
         // Reverse the original posting, then rewrite header + lines and re-post below.
         if ((int)($editRow['is_posted'] ?? 0) && !empty($editRow['jv_id'])) reverse_jv((string)$editRow['jv_id'], $u);
         db()->prepare("UPDATE actuals SET project_id=?,expense_date=?,payee=?,description=?,amount_fcy=?,amount_ghs=?,has_vat=?,vat_amount=?,has_whvat=?,whvat_amount=?,has_ucf=?,ucf_amount=?,wht_type='Mixed',wht_amount=?,expense_coa_id=?,is_multiline=1,is_posted=0,jv_id=NULL WHERE id=?")
-            ->execute([$d['project_id'] ?? ($norm[0]['project_id'] ?? null), $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '', $d['description'] ?? 'Multi-line PV', $tot, $tot,
+            ->execute([$hdrProj, $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '', $d['description'] ?? 'Multi-line PV', $tot, $tot,
                 ($tvat > 0 ? 1 : 0), round($tvat, 2), ($twhvat > 0 ? 1 : 0), round($twhvat, 2), ($tucf > 0 ? 1 : 0), round($tucf, 2), round($twht, 2), $norm[0]['coa_id'], $aid]);
         db()->prepare('DELETE FROM actual_lines WHERE actual_id=?')->execute([$aid]);
     } else {
         db()->prepare("INSERT INTO actuals(id,actual_code,project_id,expense_date,payee,description,currency,amount_fcy,pay_fx_rate,amount_ghs,
             has_vat,vat_amount,has_whvat,whvat_amount,has_ucf,ucf_amount,wht_type,wht_amount,receipt_no,expense_coa_id,is_posted,is_multiline,created_by,unit_id)
             VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)")
-            ->execute([$aid, $code, $d['project_id'] ?? ($norm[0]['project_id'] ?? null), $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '',
+            ->execute([$aid, $code, $hdrProj, $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '',
                 $d['description'] ?? 'Multi-line PV', $d['currency'] ?? 'GHS', $tot, $tot,
                 ($tvat > 0 ? 1 : 0), round($tvat, 2), ($twhvat > 0 ? 1 : 0), round($twhvat, 2), ($tucf > 0 ? 1 : 0), round($tucf, 2),
                 'Mixed', round($twht, 2), $d['receipt_no'] ?? '', $norm[0]['coa_id'], $u['username'], $unit]);
