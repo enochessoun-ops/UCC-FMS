@@ -961,6 +961,32 @@ function api_jv_workflow(): void {
         db()->prepare("UPDATE journal_vouchers SET status='Posted', posted_by=?, posted_at=datetime('now') WHERE id=?")->execute([$u['username'], $jid]);
         ok(['new_status' => 'Posted', 'jv_number' => $jv['jv_number']]);
     }
+    if ($action === 'reverse') {
+        if ($role !== 'Admin') err('Only Admins can reverse JVs', 403);
+        if ($status !== 'Posted') err("Only Posted JVs can be reversed (current: $status)");
+        ensure_col('journal_vouchers', 'is_reversal', 'INTEGER');
+        ensure_col('journal_vouchers', 'reversal_of', 'TEXT');
+        ensure_col('journal_vouchers', 'reversed_by', 'TEXT');
+        $g = db()->prepare('SELECT * FROM general_ledger WHERE jv_id=?'); $g->execute([$jid]); $glr = $g->fetchAll();
+        if (!$glr) err('No ledger entries to reverse');
+        // The reversing JV lands on the ORIGINAL date/period so the books are corrected in
+        // the period the error occurred (mirrors server.py reversal dating).
+        $rdate = (string)($jv['jv_date'] ?? date('Y-m-d')); $rperiod = (string)($jv['period'] ?? substr($rdate, 0, 7));
+        $rid = uuid4(); $rnum = seq_code('journal_vouchers', 'jv_number', 'RJV-' . substr($rperiod, 0, 4) . '-', 4);
+        $tdr = 0.0; $tcr = 0.0; foreach ($glr as $r) { $tdr += money($r['credit_amount']); $tcr += money($r['debit_amount']); }
+        db()->prepare("INSERT INTO journal_vouchers(id,jv_number,jv_type,jv_date,period,description,total_debit,total_credit,status,prepared_by,posted_by,posted_at,is_reversal,reversal_of,source_module,source_id,unit_id) VALUES(?,?,?,?,?,?,?,?,'Posted',?,?,datetime('now'),1,?,?,?,?)")
+            ->execute([$rid, $rnum, 'RJV', $rdate, $rperiod, 'Reversal of ' . $jv['jv_number'] . ': ' . (string)($d['reason'] ?? ''), $tdr, $tcr, $u['username'], $u['username'], $jid, 'reversal', $jid, $jv['unit_id'] ?? null]);
+        $gi = db()->prepare("INSERT INTO general_ledger(id,jv_id,jv_number,jv_line_id,ledger_date,period,coa_id,coa_code,account_name,description,debit_amount,credit_amount,project_id,posted_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        foreach ($glr as $r) {
+            $gi->execute([uuid4(), $rid, $rnum, null, $rdate, $rperiod, $r['coa_id'], $r['coa_code'], $r['account_name'],
+                'Reversal: ' . (string)($r['description'] ?? ''), money($r['credit_amount']), money($r['debit_amount']), $r['project_id'] ?? null, $u['username'], $r['unit_id'] ?? null]);
+        }
+        db()->prepare("UPDATE journal_vouchers SET status='Reversed', reversed_by=? WHERE id=?")->execute([$rid, $jid]);
+        if (in_array((string)($jv['source_module'] ?? ''), ['fund_receipts', 'receipts'], true) && !empty($jv['source_id'])) {
+            try { db()->prepare("UPDATE fund_receipts SET is_posted=0 WHERE id=?")->execute([$jv['source_id']]); } catch (Throwable $e) {}
+        }
+        ok(['new_status' => 'Reversed', 'jv_number' => $jv['jv_number'], 'reversal_jv' => $rnum, 'rev_date' => $rdate]);
+    }
     err("Unknown action: $action");
 }
 
@@ -2056,6 +2082,45 @@ function api_financial_integrity(): void {
     ok(['checks' => $checks]);
 }
 
+// ── Cash book: opening + receipts(Dr) − payments(Cr) = closing, with optional
+//    net view that hides a reversed entry together with its reversal (both in window). ─
+function api_cashbook(): void {
+    require_auth();
+    $dt = $_GET['date_to'] ?? ($_GET['period_to'] ?? date('Y-m-d'));
+    $df = $_GET['date_from'] ?? ($_GET['period_from'] ?? (substr((string)$dt, 0, 7) . '-01'));
+    $where = ''; $params = [];
+    if (!empty($_GET['bank_account_id'])) {
+        $bk = db()->prepare('SELECT coa_id FROM bank_accounts WHERE id=?'); $bk->execute([$_GET['bank_account_id']]);
+        $bcoa = $bk->fetchColumn(); if ($bcoa) { $where = 'gl.coa_id=?'; $params = [$bcoa]; }
+    }
+    if ($where === '') $where = "(gl.coa_code LIKE '126%' OR gl.coa_code LIKE '127%' OR gl.coa_code LIKE '128%' OR gl.coa_code LIKE '129%' OR gl.coa_code='1001')";
+    $net = $_GET['net'] ?? '1'; $net_on = !in_array((string)$net, ['0', 'false', 'no', ''], true);
+    $op = db()->prepare("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE $where AND gl.ledger_date < ?");
+    $op->execute(array_merge($params, [$df])); $opening = round((float)$op->fetchColumn(), 2);
+    $rq = db()->prepare("SELECT gl.ledger_date, gl.jv_number, gl.description, COALESCE(gl.debit_amount,0) AS receipt, COALESCE(gl.credit_amount,0) AS payment FROM general_ledger gl WHERE $where AND gl.ledger_date BETWEEN ? AND ? ORDER BY gl.ledger_date, gl.jv_number");
+    $rq->execute(array_merge($params, [$df, $dt])); $rows = $rq->fetchAll();
+    $hidden = 0;
+    if ($net_on && $rows) {
+        $present = []; foreach ($rows as $r) if (!empty($r['jv_number'])) $present[$r['jv_number']] = true;
+        $hide = [];
+        try {
+            $pr = db()->query("SELECT o.jv_number AS onum, r.jv_number AS rnum FROM journal_vouchers r JOIN journal_vouchers o ON r.reversal_of=o.id WHERE COALESCE(r.is_reversal,0)=1 AND o.jv_number IS NOT NULL AND r.jv_number IS NOT NULL");
+            foreach ($pr->fetchAll() as $p) { if (isset($present[$p['onum']]) && isset($present[$p['rnum']])) { $hide[$p['onum']] = true; $hide[$p['rnum']] = true; } }
+        } catch (Throwable $e) {}
+        if ($hide) { $kept = []; foreach ($rows as $r) if (!isset($hide[$r['jv_number']])) $kept[] = $r; $hidden = count($rows) - count($kept); $rows = $kept; }
+    }
+    $bal = $opening; $tin = 0.0; $tout = 0.0; $out = [];
+    foreach ($rows as $r) {
+        $rc = round((float)$r['receipt'], 2); $pm = round((float)$r['payment'], 2);
+        $bal = round($bal + $rc - $pm, 2); $tin += $rc; $tout += $pm;
+        $out[] = ['ledger_date' => $r['ledger_date'], 'jv_number' => $r['jv_number'], 'description' => $r['description'], 'receipt' => $rc, 'payment' => $pm, 'balance' => $bal];
+    }
+    ok(['date_from' => $df, 'date_to' => $dt, 'opening_balance' => $opening, 'rows' => $out,
+        'total_receipts' => round($tin, 2), 'total_payments' => round($tout, 2),
+        'closing_balance' => round($opening + $tin - $tout, 2), 'net_view' => $net_on,
+        'hidden_cancelled_lines' => $hidden, 'basis' => 'general_ledger']);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -2105,6 +2170,7 @@ try {
     if ($path === '/api/consolidation/export' && $method === 'GET') api_consolidation_export();
     if ($path === '/api/finance-overview' && $method === 'GET') api_finance_overview();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
+    if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
 
