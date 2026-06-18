@@ -1819,6 +1819,72 @@ function api_dunning_run(): void {
     ok(['sent' => $sent, 'queued' => $queued, 'results' => $results, 'message' => "Dunning: $sent sent, $queued queued (configure SMTP to send)"]);
 }
 
+// ── Recurring journals — standing multi-line balanced JVs (depreciation, accruals,
+//    prepayments) generated on a schedule and posted via post_journal.
+function ensure_recjv(): void {
+    db()->exec("CREATE TABLE IF NOT EXISTS rec_journals(id TEXT PRIMARY KEY, name TEXT, description TEXT, frequency TEXT DEFAULT 'Monthly', start_date TEXT, end_date TEXT, next_due_date TEXT, project_id TEXT, active INTEGER DEFAULT 1, jvs_generated INTEGER DEFAULT 0, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    db()->exec("CREATE TABLE IF NOT EXISTS rec_journal_lines(id TEXT PRIMARY KEY, rec_id TEXT, line_no INTEGER, coa_id TEXT, debit REAL DEFAULT 0, credit REAL DEFAULT 0, description TEXT)");
+}
+function api_rec_journals_list(): void {
+    ensure_recjv(); require_auth();
+    $rows = db()->query("SELECT t.*, p.project_code,
+        (SELECT COALESCE(SUM(debit),0) FROM rec_journal_lines WHERE rec_id=t.id) AS total_debit,
+        (SELECT COUNT(*) FROM rec_journal_lines WHERE rec_id=t.id) AS line_count
+        FROM rec_journals t LEFT JOIN projects p ON p.id=t.project_id ORDER BY t.active DESC, t.next_due_date")->fetchAll();
+    ok(['templates' => $rows]);
+}
+function api_save_rec_journal(): void {
+    ensure_recjv(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $name = trim((string)($d['name'] ?? '')); if ($name === '') err('Template name is required');
+    $raw = (isset($d['lines']) && is_array($d['lines'])) ? $d['lines'] : [];
+    $norm = [];
+    foreach ($raw as $ln) { $dr = round((float)($ln['debit'] ?? 0), 2); $cr = round((float)($ln['credit'] ?? 0), 2); if (empty($ln['coa_id']) || ($dr == 0 && $cr == 0)) continue; $norm[] = ['coa_id' => $ln['coa_id'], 'debit' => $dr, 'credit' => $cr, 'description' => $ln['description'] ?? '']; }
+    if (count($norm) < 2) err('Add at least two lines');
+    $td = round(array_sum(array_map(fn($l) => $l['debit'], $norm)), 2); $tc = round(array_sum(array_map(fn($l) => $l['credit'], $norm)), 2);
+    if (abs($td - $tc) > 0.01) err(sprintf('Journal not balanced: debits GHS %.2f ≠ credits GHS %.2f', $td, $tc));
+    $freq = $d['frequency'] ?? 'Monthly'; $start = $d['start_date'] ?? date('Y-m-d'); $tid = $d['id'] ?? uuid4();
+    $ex = db()->prepare("SELECT next_due_date FROM rec_journals WHERE id=?"); $ex->execute([$tid]); $exrow = $ex->fetch();
+    $nd = $d['next_due_date'] ?? (($exrow['next_due_date'] ?? null) ?: $start);
+    $active = in_array($d['active'] ?? 1, [0, '0', false, 'false'], true) ? 0 : 1;
+    if ($exrow) db()->prepare("UPDATE rec_journals SET name=?,description=?,frequency=?,start_date=?,end_date=?,next_due_date=?,project_id=?,active=? WHERE id=?")->execute([$name, $d['description'] ?? '', $freq, $start, $d['end_date'] ?? null, $nd, $d['project_id'] ?? null, $active, $tid]);
+    else db()->prepare("INSERT INTO rec_journals(id,name,description,frequency,start_date,end_date,next_due_date,project_id,active,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)")->execute([$tid, $name, $d['description'] ?? '', $freq, $start, $d['end_date'] ?? null, $nd, $d['project_id'] ?? null, $active, $u['username']]);
+    db()->prepare("DELETE FROM rec_journal_lines WHERE rec_id=?")->execute([$tid]);
+    $i = 0; $ins = db()->prepare("INSERT INTO rec_journal_lines(id,rec_id,line_no,coa_id,debit,credit,description) VALUES(?,?,?,?,?,?,?)");
+    foreach ($norm as $l) { $i++; $ins->execute([uuid4(), $tid, $i, $l['coa_id'], $l['debit'], $l['credit'], $l['description']]); }
+    ok(['id' => $tid]);
+}
+function api_rec_journal_toggle(): void {
+    ensure_recjv(); require_role(['Admin', 'Finance Officer']); $d = body();
+    $tid = (string)($d['id'] ?? ''); $st = db()->prepare("SELECT active FROM rec_journals WHERE id=?"); $st->execute([$tid]); $t = $st->fetch();
+    if (!$t) err('Template not found'); $new = $t['active'] ? 0 : 1; db()->prepare("UPDATE rec_journals SET active=? WHERE id=?")->execute([$new, $tid]);
+    ok(['id' => $tid, 'active' => $new]);
+}
+function api_rec_journal_generate(): void {
+    ensure_recjv(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $asof = (string)($d['as_of'] ?? date('Y-m-d')); $only = $d['id'] ?? null;
+    $q = "SELECT * FROM rec_journals WHERE active=1 AND next_due_date IS NOT NULL AND next_due_date<=?"; $params = [$asof];
+    if ($only) { $q .= " AND id=?"; $params[] = $only; }
+    $st = db()->prepare($q); $st->execute($params); $templates = $st->fetchAll();
+    $generated = [];
+    foreach ($templates as $t) {
+        $lq = db()->prepare("SELECT * FROM rec_journal_lines WHERE rec_id=? ORDER BY line_no"); $lq->execute([$t['id']]); $lt = $lq->fetchAll();
+        if (!$lt) continue;
+        $nd = $t['next_due_date']; $guard = 0;
+        while ($nd && substr((string)$nd, 0, 10) <= substr($asof, 0, 10) && $guard < 60) {
+            if (!empty($t['end_date']) && substr((string)$nd, 0, 10) > substr((string)$t['end_date'], 0, 10)) break;
+            $guard++;
+            $lines = array_map(fn($l) => ['coa_id' => $l['coa_id'], 'debit_amount' => round((float)$l['debit'], 2), 'credit_amount' => round((float)$l['credit'], 2), 'description' => ($l['description'] ?: $t['name']), 'project_id' => $t['project_id'] ?? null], $lt);
+            try { [$jid, $jvnum] = post_journal($u, 'JV', (string)$nd, substr((string)$nd, 0, 7), ($t['name'] ?: 'Recurring journal') . ' (' . substr((string)$nd, 0, 10) . ')', $lines, 'rec_journal', $t['id'], null); $generated[] = ['template_id' => $t['id'], 'jv_number' => $jvnum, 'due' => $nd]; }
+            catch (Throwable $e) { $generated[] = ['template_id' => $t['id'], 'due' => $nd, 'error' => $e->getMessage()]; $nd = null; break; }
+            $nd = aprec_advance($nd, $t['frequency']);
+        }
+        if ($nd) db()->prepare("UPDATE rec_journals SET next_due_date=?, jvs_generated=jvs_generated+? WHERE id=?")->execute([$nd, $guard, $t['id']]);
+        else db()->prepare("UPDATE rec_journals SET jvs_generated=jvs_generated+? WHERE id=?")->execute([$guard, $t['id']]);
+    }
+    $posted = array_values(array_filter($generated, fn($g) => !empty($g['jv_number'])));
+    ok(['generated' => $generated, 'count' => count($posted), 'message' => $posted ? ('Posted ' . count($posted) . ' journal(s)') : 'No journals due']);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3e — Financial statements derived from the general ledger: Income &
 // Expenditure, Statement of Financial Position, and Cash Flow. Mirrors the Python
@@ -2766,19 +2832,47 @@ function api_redate_reversal(): void {
 }
 
 // ── Tax schedules: per control-account accrued / remitted / outstanding ────────
+// Statutory tax pack — WHT / VAT-withholding / PAYE / SSNIT / UCF / VAT schedules
+// derived from the GL for a period: opening (prior periods, credit-debit), accrued
+// (period credits less remittance-reversals), remitted (period debits whose JV
+// credits a bank, less reversals), adjustments (period debits with no bank leg),
+// outstanding = opening + accrued − remitted − adjustments. Mirrors server.py.
 function api_tax_schedules(): void {
-    require_auth(); ensure_wh_table();
-    $rows = db()->query("SELECT c.code AS code, MAX(c.account_name) AS name,
-        COALESCE(SUM(w.amount_ghs),0) AS accrued,
-        COALESCE(SUM(CASE WHEN LOWER(w.status) IN ('paid','settled','remitted') THEN w.amount_ghs ELSE 0 END),0) AS remitted
-        FROM withholding_payables w JOIN chart_of_accounts c ON c.id=w.coa_id GROUP BY c.code ORDER BY c.code")->fetchAll();
-    $summary = [];
-    foreach ($rows as $r) {
-        $acc = round((float)$r['accrued'], 2); $rem = round((float)$r['remitted'], 2);
-        $summary[] = ['code' => $r['code'], 'name' => $r['name'], 'opening' => 0.0, 'accrued' => $acc,
-                      'remitted' => $rem, 'adjustments' => 0.0, 'outstanding' => round($acc - $rem, 2)];
+    require_auth();
+    $period = trim((string)($_GET['period'] ?? ''));
+    if ($period === '') { $r = db()->query("SELECT period FROM general_ledger ORDER BY period DESC LIMIT 1")->fetchColumn(); $period = $r ?: date('Y-m'); }
+    $taxes = [
+        ['key' => 'wht', 'label' => 'Withholding Tax (GRA)', 'codes' => ['21100014']],
+        ['key' => 'whvat', 'label' => 'VAT Withholding', 'codes' => ['21100024']],
+        ['key' => 'paye', 'label' => 'PAYE', 'codes' => ['21100017']],
+        ['key' => 'ssnit', 'label' => 'SSNIT / Social Security', 'codes' => ['21100015']],
+        ['key' => 'ucf', 'label' => 'UCC Common Fund', 'codes' => ['21100027']],
+        ['key' => 'vat', 'label' => 'VAT Returns', 'codes' => ['21100022']],
+    ];
+    $bankset = "(g2.coa_code LIKE '126%' OR g2.coa_code LIKE '127%' OR g2.coa_code LIKE '128%' OR g2.coa_code LIKE '129%' OR g2.coa_code='1001')";
+    $sc = function (string $sql, array $params) {
+        try { $st = db()->prepare($sql); $st->execute($params); $v = $st->fetchColumn(); return ($v === false || $v === null) ? 0.0 : round((float)$v, 2); }
+        catch (Throwable $e) { return 0.0; }
+    };
+    $summary = []; $detail = [];
+    foreach ($taxes as $t) {
+        $inlist = "('" . implode("','", $t['codes']) . "')";
+        $opening = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code IN $inlist AND period < ?", [$period]);
+        $accrued = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code IN $inlist AND period LIKE ?", [$period . '%']);
+        $remitted = $sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code IN $inlist AND gl.period LIKE ? AND COALESCE(gl.debit_amount,0)>0 AND EXISTS(SELECT 1 FROM general_ledger g2 WHERE g2.jv_id=gl.jv_id AND COALESCE(g2.credit_amount,0)>0 AND $bankset)", [$period . '%']);
+        $adjustments = $sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code IN $inlist AND gl.period LIKE ? AND COALESCE(gl.debit_amount,0)>0 AND NOT EXISTS(SELECT 1 FROM general_ledger g2 WHERE g2.jv_id=gl.jv_id AND COALESCE(g2.credit_amount,0)>0 AND $bankset)", [$period . '%']);
+        $revq = " AND COALESCE(gl.credit_amount,0)>0 AND EXISTS(SELECT 1 FROM general_ledger g2 WHERE g2.jv_id=gl.jv_id AND COALESCE(g2.debit_amount,0)>0 AND $bankset)";
+        $remit_reversal = $sc("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code IN $inlist AND gl.period LIKE ?" . $revq, [$period . '%']);
+        $accrued = round($accrued - $remit_reversal, 2);
+        $remitted = round($remitted - $remit_reversal, 2);
+        $outstanding = round($opening + $accrued - $remitted - $adjustments, 2);
+        $summary[] = ['key' => $t['key'], 'label' => $t['label'], 'code' => $t['codes'][0], 'opening' => $opening,
+            'accrued' => $accrued, 'remitted' => $remitted, 'adjustments' => $adjustments, 'outstanding' => $outstanding, 'lines' => 0];
+        $detail[$t['key']] = [];
     }
-    ok(['summary' => $summary, 'taxes' => $summary]);
+    ok(['period' => $period, 'summary' => $summary, 'detail' => $detail, 'taxes' => $summary,
+        'total_outstanding' => round(array_sum(array_map(fn($s) => $s['outstanding'], $summary)), 2),
+        'total_accrued' => round(array_sum(array_map(fn($s) => $s['accrued'], $summary)), 2)]);
 }
 
 // ── PPE movement schedule (IPSAS 17) — roll-forward by category, tied to the GL ──
@@ -3004,6 +3098,10 @@ try {
     if ($path === '/api/email-statement' && $method === 'POST') api_email_statement();
     if ($path === '/api/dunning-preview' && $method === 'GET') api_dunning_preview();
     if ($path === '/api/dunning-run' && $method === 'POST') api_dunning_run();
+    if ($path === '/api/rec-journals' && $method === 'GET') api_rec_journals_list();
+    if ($path === '/api/rec-journals' && $method === 'POST') api_save_rec_journal();
+    if ($path === '/api/rec-journals/toggle' && $method === 'POST') api_rec_journal_toggle();
+    if ($path === '/api/rec-journals/generate' && $method === 'POST') api_rec_journal_generate();
     if ($path === '/api/ap/payment-run-file' && $method === 'POST') api_payment_run_file();
 
     // Phase 3d (inventory) — stores ledger
