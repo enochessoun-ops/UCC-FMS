@@ -1120,7 +1120,20 @@ function ensure_arap_tables(): void {
     $p->exec("CREATE TABLE IF NOT EXISTS ap_bill_lines(id TEXT PRIMARY KEY, bill_id TEXT, line_number INTEGER, description TEXT, expense_coa_id TEXT, amount_ghs REAL DEFAULT 0)");
     $p->exec("CREATE TABLE IF NOT EXISTS ap_payments(id TEXT PRIMARY KEY, payment_number TEXT, bill_id TEXT, vendor_id TEXT, payment_date TEXT, amount_ghs REAL DEFAULT 0, bank_account_id TEXT, payment_method TEXT, reference TEXT, jv_id TEXT, jv_number TEXT, notes TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
     $p->exec("CREATE TABLE IF NOT EXISTS ar_receipts(id TEXT PRIMARY KEY, receipt_number TEXT, invoice_id TEXT, customer_id TEXT, receipt_date TEXT, amount_ghs REAL DEFAULT 0, bank_account_id TEXT, payment_method TEXT, reference TEXT, jv_id TEXT, jv_number TEXT, notes TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    $p->exec("CREATE TABLE IF NOT EXISTS ap_recurring(id TEXT PRIMARY KEY, vendor_id TEXT, description TEXT, expense_coa_id TEXT, amount_ghs REAL DEFAULT 0, project_id TEXT, frequency TEXT DEFAULT 'Monthly', start_date TEXT, end_date TEXT, next_due_date TEXT, day_offset INTEGER DEFAULT 0, auto_post INTEGER DEFAULT 0, active INTEGER DEFAULT 1, last_generated TEXT, bills_generated INTEGER DEFAULT 0, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    $p->exec("CREATE TABLE IF NOT EXISTS ar_recurring(id TEXT PRIMARY KEY, customer_id TEXT, description TEXT, income_coa_id TEXT, amount_ghs REAL DEFAULT 0, project_id TEXT, frequency TEXT DEFAULT 'Monthly', start_date TEXT, end_date TEXT, next_due_date TEXT, day_offset INTEGER DEFAULT 0, auto_post INTEGER DEFAULT 0, active INTEGER DEFAULT 1, last_generated TEXT, invoices_generated INTEGER DEFAULT 0, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
     ensure_col('ar_invoices', 'unit_id'); ensure_col('ap_bills', 'unit_id');
+}
+// Advance an ISO date by one period of the given frequency, clamping the day to the
+// target month's length (mirror server.py _aprec_advance).
+function aprec_advance(?string $iso, ?string $freq): ?string {
+    $iso = substr((string)$iso, 0, 10); $ts = strtotime($iso); if ($ts === false) return $iso;
+    if ($freq === 'Weekly') return date('Y-m-d', strtotime($iso . ' +7 days'));
+    $y = (int)date('Y', $ts); $m = (int)date('n', $ts); $day = (int)date('j', $ts);
+    $months = ['Monthly' => 1, 'Quarterly' => 3, 'Semi-Annual' => 6, 'Annually' => 12][$freq] ?? 1;
+    $m0 = $m - 1 + $months; $ny = $y + intdiv($m0, 12); $nm = $m0 % 12 + 1;
+    $maxd = (int)date('t', mktime(0, 0, 0, $nm, 1, $ny));
+    return sprintf('%04d-%02d-%02d', $ny, $nm, min($day, $maxd));
 }
 function ar_control_coa(): ?array {
     foreach (["code='12300011'", "code='12300001'", "code LIKE '123%'", "(LOWER(account_name) LIKE '%receivable%' OR LOWER(account_name) LIKE '%debtor%')"] as $w) {
@@ -1160,14 +1173,28 @@ function api_ar_invoices_list(): void {
 function api_ar_invoice_save(): void {
     ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
     if (empty($d['customer_id'])) err('customer_id is required');
-    if (empty($d['income_coa_id'])) err('income_coa_id is required');
-    $amount = round((float)($d['amount_ghs'] ?? 0), 2); $tax = round((float)($d['tax_ghs'] ?? 0), 2); $total = round($amount + $tax, 2);
+    // Accept either a multi-line invoice (lines[]) — the shape the UI/gate sends — or a
+    // single top-level income_coa_id/amount_ghs (legacy).
+    $ilines = (isset($d['lines']) && is_array($d['lines']) && $d['lines']) ? $d['lines'] : null;
+    if ($ilines) {
+        $first_coa = $ilines[0]['income_coa_id'] ?? null;
+        if (!$first_coa) err('Each invoice line needs an income_coa_id');
+        $amount = 0.0; foreach ($ilines as $l) $amount += (float)($l['amount_ghs'] ?? 0);
+        $amount = round($amount, 2);
+    } else {
+        if (empty($d['income_coa_id'])) err('income_coa_id is required');
+        $first_coa = $d['income_coa_id'];
+        $amount = round((float)($d['amount_ghs'] ?? 0), 2);
+        $ilines = [['income_coa_id' => $first_coa, 'amount_ghs' => $amount, 'description' => $d['description'] ?? '']];
+    }
+    $tax = round((float)($d['tax_ghs'] ?? 0), 2); $total = round($amount + $tax, 2);
     if ($amount <= 0) err('Invoice amount must be greater than zero');
     require_write_unit($u, $d, 'AR invoice');
     $id = uuid4(); $num = $d['invoice_number'] ?? seq_code('ar_invoices', 'invoice_number', 'INV-', 4); $unit = resolve_write_unit($u, $d);
     db()->prepare("INSERT INTO ar_invoices(id,invoice_number,customer_id,invoice_date,due_date,project_id,income_coa_id,description,amount_ghs,tax_ghs,total_ghs,status,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,'Draft',?,?)")
-        ->execute([$id, $num, $d['customer_id'], $d['invoice_date'] ?? date('Y-m-d'), $d['due_date'] ?? null, $d['project_id'] ?? null, $d['income_coa_id'], $d['description'] ?? '', $amount, $tax, $total, $u['username'], $unit]);
-    db()->prepare('INSERT INTO ar_invoice_lines(id,invoice_id,line_number,description,income_coa_id,amount_ghs) VALUES(?,?,1,?,?,?)')->execute([uuid4(), $id, $d['description'] ?? '', $d['income_coa_id'], $amount]);
+        ->execute([$id, $num, $d['customer_id'], $d['invoice_date'] ?? date('Y-m-d'), $d['due_date'] ?? null, $d['project_id'] ?? null, $first_coa, $d['description'] ?? '', $amount, $tax, $total, $u['username'], $unit]);
+    $ln = 0; $ili = db()->prepare('INSERT INTO ar_invoice_lines(id,invoice_id,line_number,description,income_coa_id,amount_ghs) VALUES(?,?,?,?,?,?)');
+    foreach ($ilines as $l) { $ln++; $ili->execute([uuid4(), $id, $ln, $l['description'] ?? '', $l['income_coa_id'], round((float)($l['amount_ghs'] ?? 0), 2)]); }
     ok(['id' => $id, 'invoice_number' => $num]);
 }
 function api_ar_invoice_post(): void {
@@ -1362,6 +1389,52 @@ function api_ap_batch_pay(): void {
         'message' => sprintf('Paid %d bill(s) as %s, total GHS %.2f', count($plans), $jvnum, $total)]);
 }
 
+// Receipt several posted/part-paid invoices in one RV (Dr Bank total, Cr Receivables
+// per invoice), record an ar_receipts row per invoice, and advance each invoice's
+// received/status. Overpayment past the outstanding balance is rejected.
+function api_ar_batch_receipt(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    ensure_col('ar_invoices', 'amount_received', 'REAL');
+    $items = (isset($d['items']) && is_array($d['items']) && $d['items']) ? $d['items']
+        : array_map(fn($i) => ['invoice_id' => $i], (array)($d['invoice_ids'] ?? []));
+    if (!$items) err('Select at least one invoice to receipt');
+    $bankId = (string)($d['bank_account_id'] ?? ''); if ($bankId === '') err('Select the bank account receiving payment');
+    $bcoa = bank_coa_from_account($bankId); $ar = ar_control_coa();
+    if (!$bcoa || !$ar) err('Bank or receivables control account could not be resolved');
+    $rdate = (string)($d['receipt_date'] ?? date('Y-m-d'));
+    $ref = trim((string)($d['reference'] ?? '')) ?: ('Batch receipt ' . $rdate);
+    $plans = []; $total = 0.0;
+    foreach ($items as $it) {
+        $iid = (string)($it['invoice_id'] ?? ($it['id'] ?? '')); if ($iid === '') continue;
+        $st = db()->prepare('SELECT * FROM ar_invoices WHERE id=?'); $st->execute([$iid]); $inv = $st->fetch();
+        if (!$inv) err('Invoice not found: ' . $iid);
+        if (!in_array($inv['status'] ?? '', ['Posted', 'Part-Paid'], true)) continue;
+        $bal = round((float)$inv['total_ghs'] - (float)($inv['amount_received'] ?? 0), 2);
+        $amt = isset($it['amount_ghs']) ? round((float)$it['amount_ghs'], 2) : $bal;
+        if ($amt <= 0) continue;
+        if ($amt > $bal + 0.01) err(sprintf('Receipt GHS %.2f exceeds balance GHS %.2f on %s', $amt, $bal, $inv['invoice_number']));
+        $plans[] = [$inv, $amt]; $total += $amt;
+    }
+    $total = round($total, 2);
+    if (!$plans) err('No receivable invoices selected (only posted/part-paid invoices can be receipted)');
+    $lines = [['coa_id' => $bcoa, 'debit_amount' => $total, 'credit_amount' => 0, 'description' => $ref, 'project_id' => null]];
+    foreach ($plans as [$inv, $amt]) $lines[] = ['coa_id' => $ar['id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Receipt ' . $inv['invoice_number'], 'project_id' => $inv['project_id']];
+    try { [$jid, $jvnum] = post_journal($u, 'RV', $rdate, substr($rdate, 0, 7), 'Batch customer receipt (' . count($plans) . ' invoices)', $lines, 'ar_receipts', 'batch', resolve_write_unit($u, $d)); }
+    catch (Throwable $e) { err('Could not post batch receipt: ' . $e->getMessage()); }
+    $results = [];
+    $ins = db()->prepare('INSERT INTO ar_receipts(id,receipt_number,invoice_id,customer_id,receipt_date,amount_ghs,bank_account_id,payment_method,reference,jv_id,jv_number,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    foreach ($plans as [$inv, $amt]) {
+        $rnum = seq_code('ar_receipts', 'receipt_number', 'ARR-', 4);
+        $ins->execute([uuid4(), $rnum, $inv['id'], $inv['customer_id'], $rdate, $amt, $bankId, 'Batch', $ref, $jid, $jvnum, 'batch', $u['username']]);
+        $newrecd = round((float)($inv['amount_received'] ?? 0) + $amt, 2);
+        $status = $newrecd >= (float)$inv['total_ghs'] - 0.01 ? 'Paid' : 'Part-Paid';
+        db()->prepare('UPDATE ar_invoices SET amount_received=?, status=? WHERE id=?')->execute([$newrecd, $status, $inv['id']]);
+        $results[] = ['invoice_number' => $inv['invoice_number'], 'amount' => $amt, 'status' => $status];
+    }
+    ok(['count' => count($plans), 'total' => $total, 'jv_number' => $jvnum, 'results' => $results,
+        'message' => sprintf('Receipted %d invoice(s) as %s, total GHS %.2f', count($plans), $jvnum, $total)]);
+}
+
 // Bank transfer instruction for one payment run: per-vendor rows with bank details
 // from the vendor master + a bank-upload CSV (base64, UTF-8 BOM). Flags any vendor
 // missing bank_name/account_number so finance can complete the master first.
@@ -1398,6 +1471,151 @@ function api_payment_run_file(): void {
     ok(['jv_number' => $jvn, 'rows' => $rows, 'total_ghs' => $total, 'beneficiaries' => count($rows),
         'csv_b64' => $csv_b64, 'filename' => 'bank_schedule_' . str_replace('/', '-', $jvn) . '.csv',
         'missing_bank_details' => $missing, 'remittance_emailed' => 0]);
+}
+
+// ── Recurring AP bills / AR invoices — standing templates that generate documents
+//    on a schedule. generate() creates one Draft per missed period up to as_of
+//    (optionally auto-posting), then advances next_due_date. toggle() pauses/resumes;
+//    paused templates are skipped by generate.
+function api_ap_recurring_list(): void {
+    ensure_arap_tables(); require_auth();
+    $rows = db()->query("SELECT t.*, v.vendor_name, v.vendor_code, coa.account_name AS expense_account, coa.code AS expense_code, p.project_code
+        FROM ap_recurring t LEFT JOIN vendors v ON v.id=t.vendor_id
+        LEFT JOIN chart_of_accounts coa ON coa.id=t.expense_coa_id
+        LEFT JOIN projects p ON p.id=t.project_id ORDER BY t.active DESC, t.next_due_date")->fetchAll();
+    ok(['templates' => $rows]);
+}
+function api_ap_save_recurring(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    if (empty($d['vendor_id'])) err('Select a vendor');
+    if (empty($d['expense_coa_id'])) err('Select the expense account to debit');
+    $amount = round((float)($d['amount_ghs'] ?? 0), 2); if ($amount <= 0) err('Amount must be greater than zero');
+    $freq = $d['frequency'] ?? 'Monthly'; $start = $d['start_date'] ?? date('Y-m-d');
+    $tid = $d['id'] ?? uuid4();
+    $ex = db()->prepare('SELECT next_due_date FROM ap_recurring WHERE id=?'); $ex->execute([$tid]); $exrow = $ex->fetch();
+    $next = $d['next_due_date'] ?? (($exrow['next_due_date'] ?? null) ?: $start);
+    $offset = (int)($d['day_offset'] ?? 0); $auto = !empty($d['auto_post']) ? 1 : 0;
+    $active = in_array($d['active'] ?? 1, [0, '0', false, 'false'], true) ? 0 : 1;
+    if ($exrow) {
+        db()->prepare("UPDATE ap_recurring SET vendor_id=?,description=?,expense_coa_id=?,amount_ghs=?,project_id=?,frequency=?,start_date=?,end_date=?,next_due_date=?,day_offset=?,auto_post=?,active=? WHERE id=?")
+            ->execute([$d['vendor_id'], $d['description'] ?? '', $d['expense_coa_id'], $amount, $d['project_id'] ?? null, $freq, $start, $d['end_date'] ?? null, $next, $offset, $auto, $active, $tid]);
+    } else {
+        db()->prepare("INSERT INTO ap_recurring(id,vendor_id,description,expense_coa_id,amount_ghs,project_id,frequency,start_date,end_date,next_due_date,day_offset,auto_post,active,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$tid, $d['vendor_id'], $d['description'] ?? '', $d['expense_coa_id'], $amount, $d['project_id'] ?? null, $freq, $start, $d['end_date'] ?? null, $next, $offset, $auto, $active, $u['username']]);
+    }
+    ok(['id' => $tid]);
+}
+function api_ap_recurring_toggle(): void {
+    ensure_arap_tables(); require_role(['Admin', 'Finance Officer']); $d = body();
+    $tid = (string)($d['id'] ?? ''); $st = db()->prepare('SELECT active FROM ap_recurring WHERE id=?'); $st->execute([$tid]); $t = $st->fetch();
+    if (!$t) err('Template not found');
+    $new = $t['active'] ? 0 : 1; db()->prepare('UPDATE ap_recurring SET active=? WHERE id=?')->execute([$new, $tid]);
+    ok(['id' => $tid, 'active' => $new]);
+}
+function api_ap_recurring_generate(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $asof = (string)($d['as_of'] ?? date('Y-m-d')); $onlyId = $d['id'] ?? null;
+    $ap = ap_control_coa(); if (!$ap) err('No payables control account (21100021) found');
+    $q = "SELECT * FROM ap_recurring WHERE active=1 AND next_due_date IS NOT NULL AND next_due_date<=?"; $params = [$asof];
+    if ($onlyId) { $q .= ' AND id=?'; $params[] = $onlyId; }
+    $st = db()->prepare($q); $st->execute($params); $templates = $st->fetchAll();
+    $generated = [];
+    foreach ($templates as $t) {
+        $guard = 0; $nd = $t['next_due_date'];
+        while ($nd && substr((string)$nd, 0, 10) <= substr($asof, 0, 10) && $guard < 60) {
+            if (!empty($t['end_date']) && substr((string)$nd, 0, 10) > substr((string)$t['end_date'], 0, 10)) break;
+            $guard++; $amount = round((float)($t['amount_ghs'] ?? 0), 2);
+            $bid = uuid4(); $num = seq_code('ap_bills', 'bill_number', 'BILL-', 4);
+            $offset = (int)($t['day_offset'] ?? 0); $due = date('Y-m-d', strtotime(substr((string)$nd, 0, 10) . " +$offset days")) ?: $nd;
+            $desc = ($t['description'] ?: 'Recurring bill') . ' (' . substr((string)$nd, 0, 10) . ')';
+            db()->prepare("INSERT INTO ap_bills(id,bill_number,vendor_invoice_no,vendor_id,bill_date,due_date,project_id,expense_coa_id,description,amount_ghs,tax_ghs,total_ghs,amount_paid,status,created_by) VALUES(?,?,'',?,?,?,?,?,?,?,0,?,0,'Draft',?)")
+                ->execute([$bid, $num, $t['vendor_id'], $nd, $due, $t['project_id'] ?? null, $t['expense_coa_id'], $desc, $amount, $amount, $u['username']]);
+            db()->prepare('INSERT INTO ap_bill_lines(id,bill_id,line_number,description,expense_coa_id,amount_ghs) VALUES(?,?,1,?,?,?)')->execute([uuid4(), $bid, $desc, $t['expense_coa_id'], $amount]);
+            $jvnum = null;
+            if (!empty($t['auto_post'])) {
+                $lines = [['coa_id' => $t['expense_coa_id'], 'debit_amount' => $amount, 'credit_amount' => 0, 'description' => $desc, 'project_id' => $t['project_id'] ?? null],
+                          ['coa_id' => $ap['id'], 'debit_amount' => 0, 'credit_amount' => $amount, 'description' => 'Bill ' . $num, 'project_id' => $t['project_id'] ?? null]];
+                try { [$jid, $jvnum] = post_journal($u, 'JV', (string)$nd, substr((string)$nd, 0, 7), 'Bill ' . $num, $lines, 'ap_bills', $bid, null);
+                    db()->prepare("UPDATE ap_bills SET status='Posted', jv_id=?, jv_number=?, posted_at=datetime('now') WHERE id=?")->execute([$jid, $jvnum, $bid]); }
+                catch (Throwable $e) { $generated[] = ['template_id' => $t['id'], 'bill_number' => $num, 'due' => $nd, 'amount' => $amount, 'posted' => false, 'note' => $e->getMessage()]; $nd = null; break; }
+            }
+            $generated[] = ['template_id' => $t['id'], 'bill_number' => $num, 'due' => $nd, 'amount' => $amount, 'posted' => (bool)$jvnum, 'jv_number' => $jvnum];
+            $nd = aprec_advance($nd, $t['frequency']);
+        }
+        if ($nd) db()->prepare('UPDATE ap_recurring SET next_due_date=?, last_generated=?, bills_generated=bills_generated+? WHERE id=?')->execute([$nd, $asof, $guard, $t['id']]);
+        else db()->prepare('UPDATE ap_recurring SET last_generated=?, bills_generated=bills_generated+? WHERE id=?')->execute([$asof, $guard, $t['id']]);
+    }
+    ok(['generated' => $generated, 'count' => count($generated)]);
+}
+function api_ar_recurring_list(): void {
+    ensure_arap_tables(); require_auth();
+    $rows = db()->query("SELECT t.*, c.customer_name, c.customer_code, coa.account_name AS income_account, coa.code AS income_code, p.project_code
+        FROM ar_recurring t LEFT JOIN ar_customers c ON c.id=t.customer_id
+        LEFT JOIN chart_of_accounts coa ON coa.id=t.income_coa_id
+        LEFT JOIN projects p ON p.id=t.project_id ORDER BY t.active DESC, t.next_due_date")->fetchAll();
+    ok(['templates' => $rows]);
+}
+function api_ar_save_recurring(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    if (empty($d['customer_id'])) err('Select a customer');
+    if (empty($d['income_coa_id'])) err('Select the income account to credit');
+    $amount = round((float)($d['amount_ghs'] ?? 0), 2); if ($amount <= 0) err('Amount must be greater than zero');
+    $freq = $d['frequency'] ?? 'Monthly'; $start = $d['start_date'] ?? date('Y-m-d');
+    $tid = $d['id'] ?? uuid4();
+    $ex = db()->prepare('SELECT next_due_date FROM ar_recurring WHERE id=?'); $ex->execute([$tid]); $exrow = $ex->fetch();
+    $next = $d['next_due_date'] ?? (($exrow['next_due_date'] ?? null) ?: $start);
+    $offset = (int)($d['day_offset'] ?? 0); $auto = !empty($d['auto_post']) ? 1 : 0;
+    $active = in_array($d['active'] ?? 1, [0, '0', false, 'false'], true) ? 0 : 1;
+    if ($exrow) {
+        db()->prepare("UPDATE ar_recurring SET customer_id=?,description=?,income_coa_id=?,amount_ghs=?,project_id=?,frequency=?,start_date=?,end_date=?,next_due_date=?,day_offset=?,auto_post=?,active=? WHERE id=?")
+            ->execute([$d['customer_id'], $d['description'] ?? '', $d['income_coa_id'], $amount, $d['project_id'] ?? null, $freq, $start, $d['end_date'] ?? null, $next, $offset, $auto, $active, $tid]);
+    } else {
+        db()->prepare("INSERT INTO ar_recurring(id,customer_id,description,income_coa_id,amount_ghs,project_id,frequency,start_date,end_date,next_due_date,day_offset,auto_post,active,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$tid, $d['customer_id'], $d['description'] ?? '', $d['income_coa_id'], $amount, $d['project_id'] ?? null, $freq, $start, $d['end_date'] ?? null, $next, $offset, $auto, $active, $u['username']]);
+    }
+    ok(['id' => $tid]);
+}
+function api_ar_recurring_toggle(): void {
+    ensure_arap_tables(); require_role(['Admin', 'Finance Officer']); $d = body();
+    $tid = (string)($d['id'] ?? ''); $st = db()->prepare('SELECT active FROM ar_recurring WHERE id=?'); $st->execute([$tid]); $t = $st->fetch();
+    if (!$t) err('Template not found');
+    $new = $t['active'] ? 0 : 1; db()->prepare('UPDATE ar_recurring SET active=? WHERE id=?')->execute([$new, $tid]);
+    ok(['id' => $tid, 'active' => $new]);
+}
+function api_ar_recurring_generate(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $asof = (string)($d['as_of'] ?? date('Y-m-d')); $onlyId = $d['id'] ?? null;
+    $ar = ar_control_coa(); if (!$ar) err('No receivables control account (123xxxxx) found');
+    $q = "SELECT * FROM ar_recurring WHERE active=1 AND next_due_date IS NOT NULL AND next_due_date<=?"; $params = [$asof];
+    if ($onlyId) { $q .= ' AND id=?'; $params[] = $onlyId; }
+    $st = db()->prepare($q); $st->execute($params); $templates = $st->fetchAll();
+    $generated = [];
+    foreach ($templates as $t) {
+        $guard = 0; $nd = $t['next_due_date'];
+        while ($nd && substr((string)$nd, 0, 10) <= substr($asof, 0, 10) && $guard < 60) {
+            if (!empty($t['end_date']) && substr((string)$nd, 0, 10) > substr((string)$t['end_date'], 0, 10)) break;
+            $guard++; $amount = round((float)($t['amount_ghs'] ?? 0), 2);
+            $iid = uuid4(); $num = seq_code('ar_invoices', 'invoice_number', 'INV-', 4);
+            $offset = (int)($t['day_offset'] ?? 0); $due = date('Y-m-d', strtotime(substr((string)$nd, 0, 10) . " +$offset days")) ?: $nd;
+            $desc = ($t['description'] ?: 'Recurring invoice') . ' (' . substr((string)$nd, 0, 10) . ')';
+            db()->prepare("INSERT INTO ar_invoices(id,invoice_number,customer_id,invoice_date,due_date,project_id,income_coa_id,description,amount_ghs,tax_ghs,total_ghs,amount_received,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,0,?,0,'Draft',?)")
+                ->execute([$iid, $num, $t['customer_id'], $nd, $due, $t['project_id'] ?? null, $t['income_coa_id'], $desc, $amount, $amount, $u['username']]);
+            db()->prepare('INSERT INTO ar_invoice_lines(id,invoice_id,line_number,description,income_coa_id,amount_ghs) VALUES(?,?,1,?,?,?)')->execute([uuid4(), $iid, $desc, $t['income_coa_id'], $amount]);
+            $jvnum = null;
+            if (!empty($t['auto_post'])) {
+                $lines = [['coa_id' => $ar['id'], 'debit_amount' => $amount, 'credit_amount' => 0, 'description' => 'Invoice ' . $num, 'project_id' => $t['project_id'] ?? null],
+                          ['coa_id' => $t['income_coa_id'], 'debit_amount' => 0, 'credit_amount' => $amount, 'description' => $desc, 'project_id' => $t['project_id'] ?? null]];
+                try { [$jid, $jvnum] = post_journal($u, 'JV', (string)$nd, substr((string)$nd, 0, 7), 'Invoice ' . $num, $lines, 'ar_invoices', $iid, null);
+                    db()->prepare("UPDATE ar_invoices SET status='Posted', jv_id=?, jv_number=?, posted_at=datetime('now') WHERE id=?")->execute([$jid, $jvnum, $iid]); }
+                catch (Throwable $e) { $generated[] = ['template_id' => $t['id'], 'invoice_number' => $num, 'due' => $nd, 'amount' => $amount, 'posted' => false, 'note' => $e->getMessage()]; $nd = null; break; }
+            }
+            $generated[] = ['template_id' => $t['id'], 'invoice_number' => $num, 'due' => $nd, 'amount' => $amount, 'posted' => (bool)$jvnum, 'jv_number' => $jvnum];
+            $nd = aprec_advance($nd, $t['frequency']);
+        }
+        if ($nd) db()->prepare('UPDATE ar_recurring SET next_due_date=?, last_generated=?, invoices_generated=invoices_generated+? WHERE id=?')->execute([$nd, $asof, $guard, $t['id']]);
+        else db()->prepare('UPDATE ar_recurring SET last_generated=?, invoices_generated=invoices_generated+? WHERE id=?')->execute([$asof, $guard, $t['id']]);
+    }
+    ok(['generated' => $generated, 'count' => count($generated)]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2571,6 +2789,15 @@ try {
     if ($path === '/api/ap/bills/post' && $method === 'POST') api_ap_bill_post();
     if ($path === '/api/ap/payment' && $method === 'POST') api_ap_payment();
     if ($path === '/api/ap/batch-pay' && $method === 'POST') api_ap_batch_pay();
+    if ($path === '/api/ar/batch-receipt' && $method === 'POST') api_ar_batch_receipt();
+    if ($path === '/api/ap/recurring' && $method === 'GET') api_ap_recurring_list();
+    if ($path === '/api/ap/recurring' && $method === 'POST') api_ap_save_recurring();
+    if ($path === '/api/ap/recurring/toggle' && $method === 'POST') api_ap_recurring_toggle();
+    if ($path === '/api/ap/recurring/generate' && $method === 'POST') api_ap_recurring_generate();
+    if ($path === '/api/ar/recurring' && $method === 'GET') api_ar_recurring_list();
+    if ($path === '/api/ar/recurring' && $method === 'POST') api_ar_save_recurring();
+    if ($path === '/api/ar/recurring/toggle' && $method === 'POST') api_ar_recurring_toggle();
+    if ($path === '/api/ar/recurring/generate' && $method === 'POST') api_ar_recurring_generate();
     if ($path === '/api/ap/payment-run-file' && $method === 'POST') api_payment_run_file();
 
     // Phase 3d (inventory) — stores ledger
