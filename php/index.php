@@ -2274,6 +2274,45 @@ function api_tax_schedules(): void {
     ok(['summary' => $summary, 'taxes' => $summary]);
 }
 
+// ── PPE movement schedule (IPSAS 17) — roll-forward by category, tied to the GL ──
+function api_ppe_schedule(): void {
+    require_auth();
+    foreach (['disposal_date', 'revaluation_amount', 'impairment_amount', 'last_valuation_date'] as $c) ensure_col('asset_register', $c);
+    $fy = substr((string)($_GET['fy'] ?? date('Y')), 0, 4); $d1 = "$fy-01-01"; $d2 = "$fy-12-31";
+    $assets = db()->query("SELECT asset_category, acquisition_date, COALESCE(acquisition_cost,0) AS cost,
+        COALESCE(accumulated_depreciation,0) AS accdep, COALESCE(revaluation_amount,0) AS reval,
+        COALESCE(impairment_amount,0) AS impair, COALESCE(last_valuation_date,'') AS val_date,
+        COALESCE(disposal_date,'') AS disposal_date FROM asset_register")->fetchAll();
+    $cats = [];
+    $C = function ($n) use (&$cats) { $n = $n ?: 'General'; if (!isset($cats[$n])) $cats[$n] = ['category' => $n, 'cost_bf' => 0.0, 'additions' => 0.0, 'disposals_cost' => 0.0, 'revaluation' => 0.0, 'impairment' => 0.0, 'cost_cf' => 0.0, 'dep_bf' => 0.0, 'dep_charge' => 0.0, 'dep_released' => 0.0, 'dep_cf' => 0.0, 'nbv_bf' => 0.0, 'nbv_cf' => 0.0]; return $n; };
+    foreach ($assets as $a) {
+        $n = $C($a['asset_category']); $cost = round((float)$a['cost'], 2);
+        $acq = substr((string)$a['acquisition_date'], 0, 10); $disp = substr((string)$a['disposal_date'], 0, 10);
+        $din = $disp && $disp >= $d1 && $disp <= $d2; $dbef = $disp && $disp < $d1;
+        if ($dbef) continue;
+        if ($acq < $d1) $cats[$n]['cost_bf'] += $cost; elseif ($acq <= $d2) $cats[$n]['additions'] += $cost;
+        if ($din) { $cats[$n]['disposals_cost'] += $cost; $cats[$n]['dep_released'] += round((float)$a['accdep'], 2); }
+        if (substr((string)$a['val_date'], 0, 4) === $fy) { $cats[$n]['revaluation'] += round((float)$a['reval'], 2); $cats[$n]['impairment'] += round((float)$a['impair'], 2); }
+        if (!$din) $cats[$n]['dep_cf'] += round((float)$a['accdep'], 2);
+    }
+    try { foreach (db()->query("SELECT ar.asset_category AS cat, COALESCE(SUM(dr.monthly_dep),0) AS amt FROM depreciation_runs dr JOIN asset_register ar ON ar.id=dr.asset_id WHERE dr.run_month LIKE '$fy%' GROUP BY ar.asset_category")->fetchAll() as $r) { $c = $r['cat'] ?: 'General'; if (isset($cats[$c])) $cats[$c]['dep_charge'] = round((float)$r['amt'], 2); } } catch (Throwable $e) {}
+    foreach ($cats as &$c) {
+        $c['cost_cf'] = round($c['cost_bf'] + $c['additions'] - $c['disposals_cost'] + $c['revaluation'], 2);
+        $c['dep_bf'] = round($c['dep_cf'] + $c['dep_released'] - $c['dep_charge'] - $c['impairment'], 2);
+        $c['dep_cf'] = round($c['dep_cf'] + $c['impairment'], 2);
+        $c['nbv_bf'] = round($c['cost_bf'] - $c['dep_bf'], 2); $c['nbv_cf'] = round($c['cost_cf'] - $c['dep_cf'], 2);
+    }
+    unset($c);
+    $rows = array_values($cats); usort($rows, fn($a, $b) => strcmp($a['category'], $b['category']));
+    $tot = [];
+    foreach (['cost_bf', 'additions', 'disposals_cost', 'revaluation', 'impairment', 'cost_cf', 'dep_bf', 'dep_charge', 'dep_released', 'dep_cf', 'nbv_bf', 'nbv_cf'] as $k) { $s = 0.0; foreach ($rows as $r) $s += $r[$k]; $tot[$k] = round($s, 2); }
+    $glsum = function ($prefix, $nature) use ($d2) { $r = db()->prepare("SELECT COALESCE(SUM(COALESCE(debit_amount,0)),0), COALESCE(SUM(COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE ? AND ledger_date <= ?"); $r->execute([$prefix, $d2]); $x = $r->fetch(PDO::FETCH_NUM); $d = (float)$x[0]; $cr = (float)$x[1]; return round($nature === 'debit' ? ($d - $cr) : ($cr - $d), 2); };
+    $gl = ['gl_cost_111x' => $glsum('111%', 'debit'), 'gl_accum_119x' => $glsum('119%', 'credit')];
+    $gl['register_vs_gl_cost'] = round($tot['cost_cf'] - $gl['gl_cost_111x'], 2);
+    $gl['register_vs_gl_accum'] = round($tot['dep_cf'] - $gl['gl_accum_119x'], 2);
+    ok(['fy' => $fy, 'rows' => $rows, 'totals' => $tot, 'gl_tie' => $gl]);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -2326,6 +2365,7 @@ try {
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
     if ($path === '/api/tax-schedules' && $method === 'GET') api_tax_schedules();
+    if ($path === '/api/ppe-schedule' && $method === 'GET') api_ppe_schedule();
     if ($path === '/api/journals/redate' && $method === 'POST') api_redate_reversal();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
