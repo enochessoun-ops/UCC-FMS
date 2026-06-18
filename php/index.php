@@ -856,7 +856,8 @@ function api_actual_post(): void {
         }
         $net = round($invoice - $twht - $twhvat - $tucf, 2);
         $lines[] = ['coa_id' => $bank['id'], 'debit_amount' => 0, 'credit_amount' => $net, 'description' => 'Payment to ' . ($a['payee'] ?? ''), 'project_id' => $a['project_id']];
-        try { [$jid, $jvnum] = post_journal($u, 'PV', (string)$a['expense_date'], substr((string)$a['expense_date'], 0, 7), 'Multi-line PV: ' . ($a['payee'] ?? ''), $lines, 'actuals', $aid, ($a['unit_id'] ?? null) ?: resolve_write_unit($u, $d)); }
+        $mlnar = 'Multi-line PV: ' . ($a['payee'] ?? '') . (($a['description'] ?? '') !== '' ? ' — ' . $a['description'] : '');
+        try { [$jid, $jvnum] = post_journal($u, 'PV', (string)$a['expense_date'], substr((string)$a['expense_date'], 0, 7), $mlnar, $lines, 'actuals', $aid, ($a['unit_id'] ?? null) ?: resolve_write_unit($u, $d)); }
         catch (Throwable $e) { err('Posting failed: ' . $e->getMessage()); }
         db()->prepare('UPDATE actuals SET is_posted=1, jv_id=? WHERE id=?')->execute([$jid, $aid]);
         // Maintain the withholding subledger from the aggregated per-line deductions.
