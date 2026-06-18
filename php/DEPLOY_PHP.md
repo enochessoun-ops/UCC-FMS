@@ -68,10 +68,16 @@ verified** — it reveals environment details.
 # from the repo root, locally:
 SBS_DB=/path/to/ucc_fms.db php -S 127.0.0.1:8421 php/index.php
 curl -s localhost:8421/healthz            # {"ok":true,"status":"ok",...}
-python3 smoke_test.py     --base http://127.0.0.1:8421 --user admin --pass UCC@2024 --period 2026-06
+python3 smoke_test.py      --base http://127.0.0.1:8421 --user admin --pass UCC@2024 --period 2026-06
 python3 regression_fixes.py --base http://127.0.0.1:8421 --user admin --pass UCC@2024 --period 2026-06
+python3 tree_acceptance.py  --base http://127.0.0.1:8421 --user admin --pass UCC@2024
 ```
-Expect `SMOKE TEST: 11/11` and `REGRESSION (finance fixes): 78/78`.
+Expect `SMOKE TEST: 11/11`, `REGRESSION (finance fixes): 78/78`, and
+`TREE / FEDERATED-UNIT ACCEPTANCE: 13/13`. The third suite is the **federated-unit
+contract**: it proves a unit only sees its own subtree across every report, postings
+attribute to the right unit, parent statements roll up children, inter-unit transfers
+balance per unit, payroll cost lands on each employee's unit, scope fails closed, and
+the tree builder rejects cycles. Run it after any change to the scoping/org-tree code.
 
 ## Email / SMTP (for statements, dunning and remittance notices)
 The app **queues** every outbound email to its `email_outbox` table and shows the queue
