@@ -1116,11 +1116,19 @@ function api_vendor_save(): void {
     $u = require_role(['Admin', 'Finance Officer']);
     $d = body();
     if (empty($d['vendor_name'])) err('vendor_name is required');
-    $id = uuid4();
-    $code = $d['vendor_code'] ?? seq_code('vendors', 'vendor_code', 'VEN-', 4);
     ensure_col('vendors', 'tin'); ensure_col('vendors', 'vendor_type'); ensure_col('vendors', 'unit_id');
     foreach (['bank_name', 'account_name', 'account_number', 'email', 'phone'] as $c) ensure_col('vendors', $c);
     $unit = resolve_write_unit($u, $d);
+    // Edit-by-id (was insert-only -> Edit created a duplicate row).
+    $eid = !empty($d['id']) ? (string)$d['id'] : null;
+    if ($eid) { $e = db()->prepare('SELECT id FROM vendors WHERE id=?'); $e->execute([$eid]); if (!$e->fetchColumn()) $eid = null; }
+    if ($eid) {
+        db()->prepare('UPDATE vendors SET vendor_name=?,tin=?,vendor_type=?,bank_name=?,account_name=?,account_number=?,email=?,phone=?,unit_id=? WHERE id=?')
+            ->execute([$d['vendor_name'], $d['tin'] ?? null, $d['vendor_type'] ?? 'Supplier', $d['bank_name'] ?? null, $d['account_name'] ?? null, $d['account_number'] ?? null, $d['email'] ?? null, $d['phone'] ?? null, $unit, $eid]);
+        ok(['id' => $eid, 'updated' => true]);
+    }
+    $id = uuid4();
+    $code = $d['vendor_code'] ?? seq_code('vendors', 'vendor_code', 'VEN-', 4);
     db()->prepare('INSERT INTO vendors(id,vendor_code,vendor_name,tin,vendor_type,bank_name,account_name,account_number,email,phone,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
         ->execute([$id, $code, $d['vendor_name'], $d['tin'] ?? null, $d['vendor_type'] ?? 'Supplier', $d['bank_name'] ?? null, $d['account_name'] ?? null, $d['account_number'] ?? null, $d['email'] ?? null, $d['phone'] ?? null, $unit]);
     ok(['id' => $id, 'vendor_code' => $code]);
@@ -2910,19 +2918,21 @@ function api_comparative_report(): void {
 // Bank reconciliation statement: charges adjust the CASHBOOK side; reconciled when
 // adjusted bank == adjusted cashbook.
 function api_bank_recon_statement_save(): void {
-    require_role(['Admin', 'Finance Officer']); $d = body();
-    if (empty($d['account_id'])) err('Bank account is required');
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    // The SPA sends account_id; the table's real column is bank_account_id. Accept either.
+    $acct = (string)($d['bank_account_id'] ?? ($d['account_id'] ?? ''));
+    if ($acct === '') err('Bank account is required');
     $sb = (float)($d['statement_balance'] ?? 0); $cb = (float)($d['cashbook_balance'] ?? 0);
     $out = (float)($d['outstanding_cheques'] ?? 0); $unc = (float)($d['uncredited_lodgements'] ?? 0); $chg = (float)($d['bank_charges'] ?? 0);
     $adj_bank = round($sb - $out + $unc, 2); $adj_book = round($cb - $chg, 2); $diff = round($adj_bank - $adj_book, 2);
+    $status = abs($diff) < 0.01 ? 'Reconciled' : 'Exception';
     $rid = $d['id'] ?? uuid4();
-    try {
-        db()->exec("CREATE TABLE IF NOT EXISTS bank_reconciliations(id TEXT PRIMARY KEY, account_id TEXT, recon_date TEXT, statement_balance REAL, cashbook_balance REAL, outstanding_cheques REAL, uncredited_lodgements REAL, bank_charges REAL, recon_difference REAL, status TEXT, created_by TEXT, notes TEXT, created_at TEXT DEFAULT(datetime('now')))");
-        db()->prepare("INSERT OR REPLACE INTO bank_reconciliations(id,account_id,recon_date,statement_balance,cashbook_balance,outstanding_cheques,uncredited_lodgements,bank_charges,recon_difference,status,created_by,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-            ->execute([$rid, $d['account_id'], $d['recon_date'] ?? date('Y-m-d'), $sb, $cb, $out, $unc, $chg, $diff, abs($diff) < 0.01 ? 'Reconciled' : 'Exception', (current_user()['username'] ?? 'system'), $d['notes'] ?? null]);
-    } catch (Throwable $e) {}
+    // Write to the canonical seed columns (was inserting into a non-existent `account_id`,
+    // throwing into a swallowed catch -> the recon returned ok but persisted 0 rows).
+    db()->prepare("INSERT OR REPLACE INTO bank_reconciliations(id,bank_account_id,recon_date,statement_balance,book_balance,cashbook_balance,outstanding_cheques,uncredited_lodgements,bank_charges,recon_difference,difference,status,reconciled_by,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$rid, $acct, $d['recon_date'] ?? date('Y-m-d'), $sb, $cb, $cb, $out, $unc, $chg, $diff, $diff, $status, $u['username'] ?? 'system', $d['notes'] ?? null]);
     ok(['id' => $rid, 'adjusted_bank_balance' => $adj_bank, 'adjusted_cashbook_balance' => $adj_book,
-        'recon_difference' => $diff, 'status' => abs($diff) < 0.01 ? 'Reconciled' : 'Exception']);
+        'recon_difference' => $diff, 'status' => $status]);
 }
 // Stores bulk import — create items + post stock receipts (Dr Inventory / Cr Bank) from CSV.
 function api_inv_import(): void {
@@ -3962,11 +3972,37 @@ function api_project_save(): void {
     $u = require_role(['Admin', 'Finance Officer']); $d = body();
     if (empty($d['title'])) err('title is required');
     ensure_col('projects', 'unit_id');
-    $id = uuid4(); $code = $d['project_code'] ?? seq_code('projects', 'project_code', 'PRJ-', 4);
     $fcy = (float)($d['budget_fcy'] ?? 0); $fx = (float)($d['fx_rate'] ?? 1);
     $unit = resolve_write_unit($u, $d);
+    // Keep the legacy `division` consistent with the chosen unit instead of diverging:
+    // if not explicitly supplied, derive it from the unit's top-level college/ancestor.
+    $division = $d['division'] ?? null;
+    if (empty($division) && $unit) {
+        try {
+            $cc = db()->prepare('SELECT code, parent_code FROM org_units WHERE id=?'); $cc->execute([$unit]); $r0 = $cc->fetch();
+            $code0 = $r0['code'] ?? null; $par = $r0['parent_code'] ?? null; $seen = [];
+            // Walk up to the top-level unit (College/Directorate = child of the root), not the root itself.
+            while ($par && !isset($seen[$par])) {
+                $seen[$par] = 1; $pr = db()->prepare('SELECT code,parent_code FROM org_units WHERE code=?'); $pr->execute([$par]); $rr = $pr->fetch();
+                if (!$rr) break;
+                if (empty($rr['parent_code'])) break; // $rr is the root — keep current code0 (its child = the college)
+                $code0 = $rr['code']; $par = $rr['parent_code'];
+            }
+            $division = $code0;
+        } catch (Throwable $e) {}
+    }
+    if (empty($division)) $division = 'ADMIN';
+    $eid = !empty($d['id']) ? (string)$d['id'] : null;
+    if ($eid) { $e = db()->prepare('SELECT id FROM projects WHERE id=?'); $e->execute([$eid]); if (!$e->fetchColumn()) $eid = null; }
+    if ($eid) {
+        db()->prepare("UPDATE projects SET title=?,donor=?,division=?,start_date=?,end_date=?,currency=?,budget_fcy=?,fx_rate=?,budget_ghs=?,status=?,unit_id=? WHERE id=?")
+            ->execute([$d['title'], $d['donor'] ?? 'Internal', $division, $d['start_date'] ?? (date('Y') . '-01-01'), $d['end_date'] ?? (date('Y') . '-12-31'),
+                $d['currency'] ?? 'GHS', $fcy, $fx, $fcy * $fx, $d['status'] ?? 'Active', $unit, $eid]);
+        ok(['id' => $eid, 'project_code' => $d['project_code'] ?? '', 'updated' => true]);
+    }
+    $id = uuid4(); $code = $d['project_code'] ?? seq_code('projects', 'project_code', 'PRJ-', 4);
     db()->prepare("INSERT INTO projects(id,project_code,title,donor,division,start_date,end_date,currency,budget_fcy,fx_rate,budget_ghs,status,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        ->execute([$id, $code, $d['title'], $d['donor'] ?? 'Internal', $d['division'] ?? 'ADMIN',
+        ->execute([$id, $code, $d['title'], $d['donor'] ?? 'Internal', $division,
             $d['start_date'] ?? date('Y') . '-01-01', $d['end_date'] ?? date('Y') . '-12-31',
             $d['currency'] ?? 'GHS', $fcy, $fx, $fcy * $fx, $d['status'] ?? 'Active', $unit]);
     ok(['id' => $id, 'project_code' => $code]);
@@ -4109,11 +4145,22 @@ function ensure_user_roles(): void {
 }
 function api_user_create(): void {
     $u = require_role(['Admin']); $d = body();
+    ensure_user_roles(); ensure_col('users', 'home_unit_id'); ensure_col('users', 'scope');
+    // Edit-by-id: lets an admin reassign a user's home unit / scope / role after creation
+    // (was create-only, so unit/scope could never be changed via the API).
+    $eid = !empty($d['id']) ? (string)$d['id'] : null;
+    if ($eid) { $e = db()->prepare('SELECT id FROM users WHERE id=?'); $e->execute([$eid]); if (!$e->fetchColumn()) $eid = null; }
+    if ($eid) {
+        $sets = ['full_name=?', 'role=?', 'email=?', 'home_unit_id=?', 'scope=?', 'active=?'];
+        $params = [$d['full_name'] ?? '', $d['role'] ?? 'Finance Officer', $d['email'] ?? '', $d['home_unit_id'] ?? null, $d['scope'] ?? null, (int)($d['active'] ?? 1)];
+        if (!empty($d['password'])) { $sets[] = 'password_hash=?'; $params[] = hash('sha256', (string)$d['password']); }
+        $params[] = $eid;
+        db()->prepare('UPDATE users SET ' . implode(',', $sets) . ' WHERE id=?')->execute($params);
+        ok(['id' => $eid, 'updated' => true]);
+    }
     if (empty($d['username']) || empty($d['full_name']) || empty($d['role'])) err('username, full_name and role are required');
-    ensure_user_roles();
     if (empty($d['password'])) err('Password required for new user');
     $id = uuid4();
-    ensure_col('users', 'home_unit_id'); ensure_col('users', 'scope');
     db()->prepare("INSERT INTO users(id,username,password_hash,full_name,role,email,active,home_unit_id,scope) VALUES(?,?,?,?,?,?,1,?,?)")
         ->execute([$id, $d['username'], hash('sha256', (string)$d['password']), $d['full_name'], $d['role'],
             $d['email'] ?? '', $d['home_unit_id'] ?? null, $d['scope'] ?? ($d['role'] === 'Admin' ? 'university' : 'own_unit')]);

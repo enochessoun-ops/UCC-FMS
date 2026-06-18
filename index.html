@@ -1924,6 +1924,8 @@ function updateUserUI(){
   GET('/api/bank-accounts').then(function(accts){if(accts)S.cache.bankAccounts=accts;});
   GET('/api/projects').then(function(ps){if(ps)S.cache.projects=ps;});
   GET('/api/budgets').then(function(bs){if(bs)S.cache.budgets=bs;});
+  // Pre-load the org-unit tree so every form's unit/cost-centre picker is populated.
+  GET('/api/org-units').then(function(o){if(o)S.cache.orgUnits=o;});
   // Demo mode banner
   var banner=document.getElementById('demo-banner');
   if(u.username==='demo'){
@@ -2226,7 +2228,7 @@ function openProjectModal(p=null){
     <div class="fg"><label>Grant Title <span class="req">*</span></label><input id="fp-title" value="${p?.title||''}" placeholder="Full project title"></div>
     <div class="fr">
       <div class="fg"><label>Donor / Funder <span class="req">*</span></label><input id="fp-donor" value="${p?.donor||''}" placeholder="World Bank, EU, UNDP…"></div>
-      <div class="fg"><label>Department <span class="req">*</span></label><select id="fp-div"><option value="">-- Select Unit --</option>${divs.map(d=>`<option value="${d}" ${p?.division===d?'selected':''}>${(typeof SBS_DEPT_LABELS!=='undefined'&&SBS_DEPT_LABELS[d])||d}</option>`).join('')}</select></div>
+      <div class="fg"><label>Unit / Cost Centre <span class="req">*</span></label><select id="fp-orgunit">${typeof _jvUnitOptions==='function'?_jvUnitOptions(p?.unit_id||''):('<option value="">-- Select Unit --</option>'+divs.map(d=>`<option value="${d}" ${p?.division===d?'selected':''}>${(typeof SBS_DEPT_LABELS!=='undefined'&&SBS_DEPT_LABELS[d])||d}</option>`).join(''))}</select></div>
     </div>
     <div class="fr">
       <div class="fg"><label>Start Date <span class="req">*</span></label><input type="date" id="fp-start" value="${p?.start_date?.slice(0,10)||''}"></div>
@@ -2241,8 +2243,10 @@ function openProjectModal(p=null){
     <div class="fg"><label>Principal Investigator</label><input id="fp-pi" value="${p?.pi_name||''}"></div>
     <div class="fg"><label>Notes</label><textarea id="fp-notes">${p?.notes||''}</textarea></div>
   `, async ()=>{
-    const data={id:p?.id,project_code:$('fp-code').value,title:$('fp-title').value,donor:$('fp-donor').value,division:$('fp-div').value,start_date:$('fp-start').value,end_date:$('fp-end').value,currency:$('fp-curr').value,budget_fcy:$('fp-bfcy').value,fx_rate:$('fp-fx').value,status:$('fp-status').value,pi_name:$('fp-pi').value,notes:$('fp-notes').value};
+    const _pu=($('fp-orgunit')&&$('fp-orgunit').value)||'';
+    const data={id:p?.id,project_code:$('fp-code').value,title:$('fp-title').value,donor:$('fp-donor').value,unit_id:_pu,start_date:$('fp-start').value,end_date:$('fp-end').value,currency:$('fp-curr').value,budget_fcy:$('fp-bfcy').value,fx_rate:$('fp-fx').value,status:$('fp-status').value,pi_name:$('fp-pi').value,notes:$('fp-notes').value};
     if(!data.title||!data.donor||!data.budget_fcy){toast('Fill required fields','error');return;}
+    if(typeof _requireUnit==='function' && !_requireUnit(_pu)){return;}
     const r=await POST('/api/projects',data);
     if(r?.ok){toast('Project saved!','success');closeModal();S.cache.projects=null;vProjects();}
     else toast(r?.error||'Error','error');
