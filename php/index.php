@@ -2020,6 +2020,42 @@ function api_consolidation_export(): void {
         'lines' => $lines, 'format' => 'ucc-consolidation-v1']);
 }
 
+// ── Finance overview (command-centre roll-up) + Financial-integrity cockpit ────
+function api_finance_overview(): void {
+    require_auth();
+    $cash = round((float)db()->query("SELECT COALESCE(SUM(gl.debit_amount-gl.credit_amount),0) FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id WHERE c.code LIKE '127%' OR c.code LIKE '126%'")->fetchColumn(), 2);
+    $recv = 0.0; $ar = ar_control_coa();
+    if ($ar) { $s = db()->prepare("SELECT COALESCE(SUM(debit_amount-credit_amount),0) FROM general_ledger WHERE coa_id=?"); $s->execute([$ar['id']]); $recv = round((float)$s->fetchColumn(), 2); }
+    $pay = 0.0; $ap = ap_control_coa();
+    if ($ap) { $s = db()->prepare("SELECT COALESCE(SUM(credit_amount-debit_amount),0) FROM general_ledger WHERE coa_id=?"); $s->execute([$ap['id']]); $pay = round((float)$s->fetchColumn(), 2); }
+    $inv = 0.0; try { ensure_inv_tables(); $inv = round((float)db()->query("SELECT COALESCE(SUM(qty_on_hand*avg_cost),0) FROM inv_items")->fetchColumn(), 2); } catch (Throwable $e) {}
+    $tax = round((float)db()->query("SELECT COALESCE(SUM(gl.credit_amount-gl.debit_amount),0) FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id WHERE c.code IN ('21100014','21100024','21100027','2030','2031','2033')")->fetchColumn(), 2);
+    $ca = round($cash + $recv + $inv, 2); $nwc = round($ca - $pay, 2);
+    $overdue = 0; try { $overdue = (int)db()->query("SELECT COUNT(*) FROM ar_invoices WHERE status IN ('Posted','Part-Paid') AND COALESCE(due_date,'') < date('now') AND ROUND(COALESCE(total_ghs,0)-COALESCE(amount_received,0),2)>0.01")->fetchColumn(); } catch (Throwable $e) {}
+    $low = 0; try { $low = (int)db()->query("SELECT COUNT(*) FROM inv_items WHERE COALESCE(reorder_level,0)>0 AND COALESCE(qty_on_hand,0) <= reorder_level")->fetchColumn(); } catch (Throwable $e) {}
+    $pos = 0; try { $pos = (int)db()->query("SELECT COUNT(*) FROM purchase_orders WHERE COALESCE(status,'')='Received'")->fetchColumn(); } catch (Throwable $e) {}
+    ok(['cash' => $cash, 'receivables' => $recv, 'payables' => $pay, 'inventory_value' => $inv,
+        'current_assets' => $ca, 'net_working_capital' => $nwc, 'overdue_customers' => $overdue,
+        'low_stock_items' => $low, 'pos_to_bill' => $pos, 'tax_outstanding' => $tax]);
+}
+function api_financial_integrity(): void {
+    require_auth(); $checks = [];
+    $sub = (float)db()->query("SELECT COALESCE(SUM(amount_ghs),0) FROM withholding_payables WHERE COALESCE(status,'') NOT IN ('Paid','Cancelled')")->fetchColumn();
+    $glw = (float)db()->query("SELECT COALESCE(SUM(gl.credit_amount-gl.debit_amount),0) FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id WHERE c.code IN ('21100014','21100024','21100027','2030','2031','2033')")->fetchColumn();
+    $whd = round($sub - $glw, 2);
+    $checks[] = ['key' => 'withholding_tie', 'status' => abs($whd) < 0.02 ? 'pass' : 'fail', 'message' => sprintf('Subledger GHS %.2f vs GL control GHS %.2f (diff %.2f)', $sub, $glw, $whd)];
+    $a = gl_net_by_type('Asset'); $l = round(-gl_net_by_type('Liability'), 2); $eq = round(-gl_net_by_type('Equity'), 2);
+    $inc = round(-gl_net_by_type('Income'), 2); $exp = gl_net_by_type('Expense'); $na = round($eq + ($inc - $exp), 2);
+    $diff = round($a - ($l + $na), 2);
+    $checks[] = ['key' => 'sfp_balance', 'status' => abs($diff) < 0.05 ? 'pass' : 'fail', 'message' => sprintf('Assets %.2f = Liabilities %.2f + Net assets %.2f (diff %.2f)', $a, $l, $na, $diff)];
+    $arc = 0.0; $ar = ar_control_coa();
+    if ($ar) { $s = db()->prepare("SELECT COALESCE(SUM(debit_amount-credit_amount),0) FROM general_ledger WHERE coa_id=?"); $s->execute([$ar['id']]); $arc = round((float)$s->fetchColumn(), 2); }
+    $arsub = 0.0; try { $arsub = round((float)db()->query("SELECT COALESCE(SUM(ROUND(COALESCE(total_ghs,0)-COALESCE(amount_received,0),2)),0) FROM ar_invoices WHERE status IN ('Posted','Part-Paid')")->fetchColumn(), 2); } catch (Throwable $e) {}
+    $ard = round($arc - $arsub, 2);
+    $checks[] = ['key' => 'ar_control_tie', 'status' => abs($ard) < 0.05 ? 'pass' : 'fail', 'message' => sprintf('AR control GHS %.2f vs open invoices GHS %.2f (diff %.2f)', $arc, $arsub, $ard)];
+    ok(['checks' => $checks]);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -2067,6 +2103,8 @@ try {
     if ($path === '/api/trial-balance' && $method === 'GET') api_trial_balance();
     if ($path === '/api/trends' && $method === 'GET') api_trends();
     if ($path === '/api/consolidation/export' && $method === 'GET') api_consolidation_export();
+    if ($path === '/api/finance-overview' && $method === 'GET') api_finance_overview();
+    if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
 
