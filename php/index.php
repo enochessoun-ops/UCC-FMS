@@ -772,7 +772,15 @@ function api_save_multiline_actual(): void {
     $u = require_role(['Admin', 'Finance Officer']); ensure_actual_lines(); ensure_col('actuals', 'expense_coa_id'); ensure_col('actuals', 'unit_id'); ensure_col('actuals', 'is_multiline'); $d = body();
     $lines_in = $d['lines'] ?? []; if (!is_array($lines_in) || count($lines_in) < 1) err('Add at least one payment line');
     if (empty($d['project_id']) && empty($lines_in[0]['project_id'])) { /* project optional per line */ }
-    $aid = uuid4(); $code = seq_code('actuals', 'actual_code', 'ACT-', 4);
+    // Edit path: an `id` for an existing PV makes this an audit-controlled correction —
+    // reverse the original posting, replace the lines, and re-post (see tail).
+    $editId = !empty($d['id']) ? (string)$d['id'] : null; $editRow = null;
+    if ($editId) { $eq = db()->prepare('SELECT * FROM actuals WHERE id=?'); $eq->execute([$editId]); $editRow = $eq->fetch() ?: null; }
+    if ($editRow) {
+        if (empty($d['edit_reason'])) err('Admin edit reason is required to amend a posted PV');
+        if (actual_has_remitted_withholding($editId)) err('Cannot edit this voucher: its withholding has already been remitted to the authority — reverse the remittance first.');
+        $aid = $editId; $code = (string)$editRow['actual_code'];
+    } else { $aid = uuid4(); $code = seq_code('actuals', 'actual_code', 'ACT-', 4); }
     $tot = 0.0; $tvat = 0.0; $twhvat = 0.0; $tucf = 0.0; $twht = 0.0; $norm = [];
     foreach ($lines_in as $i => $ln) {
         $coa = $ln['coa_id'] ?? ($ln['expense_coa_id'] ?? null);
@@ -792,16 +800,26 @@ function api_save_multiline_actual(): void {
     }
     require_write_unit($u, $d, 'payment voucher');
     $unit = resolve_write_unit($u, $d);
-    db()->prepare("INSERT INTO actuals(id,actual_code,project_id,expense_date,payee,description,currency,amount_fcy,pay_fx_rate,amount_ghs,
-        has_vat,vat_amount,has_whvat,whvat_amount,has_ucf,ucf_amount,wht_type,wht_amount,receipt_no,expense_coa_id,is_posted,is_multiline,created_by,unit_id)
-        VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)")
-        ->execute([$aid, $code, $d['project_id'] ?? ($norm[0]['project_id'] ?? null), $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '',
-            $d['description'] ?? 'Multi-line PV', $d['currency'] ?? 'GHS', $tot, $tot,
-            ($tvat > 0 ? 1 : 0), round($tvat, 2), ($twhvat > 0 ? 1 : 0), round($twhvat, 2), ($tucf > 0 ? 1 : 0), round($tucf, 2),
-            'Mixed', round($twht, 2), $d['receipt_no'] ?? '', $norm[0]['coa_id'], $u['username'], $unit]);
+    if ($editRow) {
+        // Reverse the original posting, then rewrite header + lines and re-post below.
+        if ((int)($editRow['is_posted'] ?? 0) && !empty($editRow['jv_id'])) reverse_jv((string)$editRow['jv_id'], $u);
+        db()->prepare("UPDATE actuals SET project_id=?,expense_date=?,payee=?,description=?,amount_fcy=?,amount_ghs=?,has_vat=?,vat_amount=?,has_whvat=?,whvat_amount=?,has_ucf=?,ucf_amount=?,wht_type='Mixed',wht_amount=?,expense_coa_id=?,is_multiline=1,is_posted=0,jv_id=NULL WHERE id=?")
+            ->execute([$d['project_id'] ?? ($norm[0]['project_id'] ?? null), $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '', $d['description'] ?? 'Multi-line PV', $tot, $tot,
+                ($tvat > 0 ? 1 : 0), round($tvat, 2), ($twhvat > 0 ? 1 : 0), round($twhvat, 2), ($tucf > 0 ? 1 : 0), round($tucf, 2), round($twht, 2), $norm[0]['coa_id'], $aid]);
+        db()->prepare('DELETE FROM actual_lines WHERE actual_id=?')->execute([$aid]);
+    } else {
+        db()->prepare("INSERT INTO actuals(id,actual_code,project_id,expense_date,payee,description,currency,amount_fcy,pay_fx_rate,amount_ghs,
+            has_vat,vat_amount,has_whvat,whvat_amount,has_ucf,ucf_amount,wht_type,wht_amount,receipt_no,expense_coa_id,is_posted,is_multiline,created_by,unit_id)
+            VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)")
+            ->execute([$aid, $code, $d['project_id'] ?? ($norm[0]['project_id'] ?? null), $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '',
+                $d['description'] ?? 'Multi-line PV', $d['currency'] ?? 'GHS', $tot, $tot,
+                ($tvat > 0 ? 1 : 0), round($tvat, 2), ($twhvat > 0 ? 1 : 0), round($twhvat, 2), ($tucf > 0 ? 1 : 0), round($tucf, 2),
+                'Mixed', round($twht, 2), $d['receipt_no'] ?? '', $norm[0]['coa_id'], $u['username'], $unit]);
+    }
     $li = db()->prepare("INSERT INTO actual_lines(id,actual_id,line_no,project_id,coa_id,description,amount_ghs,is_taxable,has_vat,has_whvat,has_ucf,wht_type,vat_amount,whvat_amount,ucf_amount,wht_amount,budget_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     $n = 0;
     foreach ($norm as $ln) { $n++; $li->execute([uuid4(), $aid, $n, $ln['project_id'], $ln['coa_id'], $ln['description'], $ln['amount'], $ln['is_taxable'], $ln['has_vat'], $ln['has_whvat'], $ln['has_ucf'], $ln['wht_type'], $ln['t']['vat'], $ln['t']['whvat'], $ln['t']['ucf'], $ln['t']['wht'], $ln['budget_id']]); }
+    if ($editRow) { api_actual_post(); return; } // re-post the amended PV (reads body 'id'); upserts payables + ok-exits
     ok(['id' => $aid, 'actual_code' => $code, 'lines' => $n]);
 }
 function api_actual_post(): void {
@@ -841,6 +859,8 @@ function api_actual_post(): void {
         try { [$jid, $jvnum] = post_journal($u, 'PV', (string)$a['expense_date'], substr((string)$a['expense_date'], 0, 7), 'Multi-line PV: ' . ($a['payee'] ?? ''), $lines, 'actuals', $aid, ($a['unit_id'] ?? null) ?: resolve_write_unit($u, $d)); }
         catch (Throwable $e) { err('Posting failed: ' . $e->getMessage()); }
         db()->prepare('UPDATE actuals SET is_posted=1, jv_id=? WHERE id=?')->execute([$jid, $aid]);
+        // Maintain the withholding subledger from the aggregated per-line deductions.
+        try { create_withholding_payables($aid, $a, ['wht' => round($twht, 2), 'whvat' => round($twhvat, 2), 'ucf' => round($tucf, 2)], $jvnum, $u); } catch (Throwable $e) {}
         ok(['status' => 'Posted', 'jv_number' => $jvnum, 'net_paid' => $net]);
     }
     // resolve accounts
@@ -915,6 +935,7 @@ function api_actual_update(): void {
     if (empty($d['edit_reason'])) err('Admin edit reason is required to amend a posted PV');
     $st = db()->prepare('SELECT * FROM actuals WHERE id=?'); $st->execute([$aid]); $a = $st->fetch();
     if (!$a) err('Expense not found');
+    if (actual_has_remitted_withholding($aid)) err('Cannot edit this voucher: its withholding has already been remitted to the authority — reverse the remittance first.');
     // Audit-controlled correction: reverse the original posting, then re-post the amended PV.
     if ((int)($a['is_posted'] ?? 0) && !empty($a['jv_id'])) reverse_jv((string)$a['jv_id'], $u);
     $pay_fx = (float)($d['pay_fx_rate'] ?? ($a['pay_fx_rate'] ?? 1));
@@ -3313,17 +3334,41 @@ function ensure_wh_table(): void {
     // The table may pre-exist from the Python seed without this column.
     ensure_col('withholding_payables', 'settled_jv');
 }
+// Maintain the withholding subledger for a PV (single- or multi-line). UPSERT keyed
+// on (actual_id, payable_type): create on first post, update IN PLACE on a re-post
+// (same row id, so an edited rate flows through), cancel when an edit removes the
+// deduction. A settled (Remitted/Paid) payable is never silently overwritten — edits
+// to such a voucher are blocked upstream.
 function create_withholding_payables(string $aid, array $a, array $t, ?string $jvnum, array $u): void {
     ensure_wh_table();
-    $payables = [['WHT', $t['wht'], ['2030'], 'WHT Payable (' . ($a['wht_type'] ?? '') . ')', 'Ghana Revenue Authority'],
-                 ['WHVAT', $t['whvat'], ['2031', '2034'], 'WHVAT Payable', 'Ghana Revenue Authority'],
-                 ['UCF', $t['ucf'], ['2033', '2035'], 'UCC Common Fund Payable', 'University of Cape Coast']];
-    foreach ($payables as $pp) {
-        $amt = round((float)$pp[1], 2); if ($amt <= 0) continue;
-        $coa = get_coa($pp[2]); if (!$coa) continue;
-        db()->prepare("INSERT INTO withholding_payables(id,actual_id,source_pv_number,payable_type,payable_label,beneficiary,coa_id,project_id,amount_ghs,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,'Pending',?)")
-            ->execute([uuid4(), $aid, $jvnum, $pp[0], $pp[3], $pp[4], $coa['id'], $a['project_id'] ?? null, $amt, $u['username']]);
+    $defs = [['WHT', round((float)($t['wht'] ?? 0), 2), ['2030'], 'WHT Payable (' . ($a['wht_type'] ?? '') . ')', 'Ghana Revenue Authority'],
+             ['WHVAT', round((float)($t['whvat'] ?? 0), 2), ['2031', '2034'], 'WHVAT Payable', 'Ghana Revenue Authority'],
+             ['UCF', round((float)($t['ucf'] ?? 0), 2), ['2033', '2035'], 'UCC Common Fund Payable', 'University of Cape Coast']];
+    $settled = ['paid', 'settled', 'remitted'];
+    foreach ($defs as [$type, $amt, $codes, $label, $benef]) {
+        $ex = db()->prepare("SELECT id, status FROM withholding_payables WHERE actual_id=? AND payable_type=? ORDER BY created_at DESC LIMIT 1");
+        $ex->execute([$aid, $type]); $row = $ex->fetch();
+        $isSettled = $row && in_array(strtolower((string)$row['status']), $settled, true);
+        if ($amt > 0) {
+            $coa = get_coa($codes); if (!$coa) continue;
+            if ($row && !$isSettled) {
+                db()->prepare("UPDATE withholding_payables SET amount_ghs=?, source_pv_number=?, payable_label=?, coa_id=?, status=CASE WHEN status='Cancelled' THEN 'Pending' ELSE status END WHERE id=?")
+                    ->execute([$amt, $jvnum, $label, $coa['id'], $row['id']]);
+            } elseif (!$row) {
+                db()->prepare("INSERT INTO withholding_payables(id,actual_id,source_pv_number,payable_type,payable_label,beneficiary,coa_id,project_id,amount_ghs,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,'Pending',?)")
+                    ->execute([uuid4(), $aid, $jvnum, $type, $label, $benef, $coa['id'], $a['project_id'] ?? null, $amt, $u['username']]);
+            }
+        } elseif ($row && !$isSettled) {
+            db()->prepare("UPDATE withholding_payables SET status='Cancelled' WHERE id=?")->execute([$row['id']]);
+        }
     }
+}
+// True if this voucher has any withholding that has already been remitted/settled — such
+// a PV must not be edited (you cannot reverse a settled statutory liability in place).
+function actual_has_remitted_withholding(string $aid): bool {
+    ensure_wh_table();
+    $q = db()->prepare("SELECT COUNT(*) FROM withholding_payables WHERE actual_id=? AND LOWER(status) IN ('paid','settled','remitted')");
+    $q->execute([$aid]); return (int)$q->fetchColumn() > 0;
 }
 function api_withholding_list(): void {
     require_auth(); ensure_wh_table();
