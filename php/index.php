@@ -2062,6 +2062,93 @@ function api_export_file(): void {
     ok($r);
 }
 
+// One-click external-audit bundle: a ZIP (base64) of CSV schedules + a manifest.
+// Every section is best-effort and GL/table-derived; a failed section is reported
+// in the manifest, never kills the pack.
+function api_audit_pack(): void {
+    require_role(['Admin', 'Finance Officer', 'Auditor']); ensure_arap_tables();
+    $fy = substr((string)($_GET['fy'] ?? date('Y')), 0, 4); $d1 = "$fy-01-01"; $d2 = "$fy-12-31";
+    $tmp = tempnam(sys_get_temp_dir(), 'apack'); $zip = new ZipArchive(); $zip->open($tmp, ZipArchive::OVERWRITE);
+    $sections = [];
+    $csv = function (array $headers, array $rows): string {
+        $esc = fn($x) => '"' . str_replace('"', '""', (string)$x) . '"';
+        $s = implode(',', array_map($esc, $headers)) . "\r\n";
+        foreach ($rows as $r) $s .= implode(',', array_map($esc, $r)) . "\r\n";
+        return "\xEF\xBB\xBF" . $s;
+    };
+    $add = function (string $name, callable $fn) use (&$sections, $zip, $csv) {
+        try { [$h, $rows] = $fn(); $zip->addFromString($name, $csv($h, $rows)); $sections[] = ['name' => $name, 'ok' => true, 'rows' => count($rows)]; }
+        catch (Throwable $e) { $sections[] = ['name' => $name, 'ok' => false, 'error' => substr($e->getMessage(), 0, 160)]; }
+    };
+    $q = function (string $sql, array $p = []) { $st = db()->prepare($sql); $st->execute($p); return $st->fetchAll(); };
+    $add("01_trial_balance_$fy.csv", function () use ($q, $d2) {
+        $rr = $q("SELECT gl.coa_code AS code, COALESCE(MAX(gl.account_name),'') AS nm, ROUND(SUM(COALESCE(gl.debit_amount,0)),2) AS dr, ROUND(SUM(COALESCE(gl.credit_amount,0)),2) AS cr FROM general_ledger gl WHERE gl.ledger_date <= ? GROUP BY gl.coa_code ORDER BY gl.coa_code", [$d2]);
+        $out = []; $td = 0; $tc = 0;
+        foreach ($rr as $r) { $d = (float)$r['dr']; $c = (float)$r['cr']; $td += $d; $tc += $c; $out[] = [$r['code'], $r['nm'], $r['dr'], $r['cr'], round(max($d - $c, 0), 2), round(max($c - $d, 0), 2)]; }
+        $out[] = ['TOTAL', '', round($td, 2), round($tc, 2), '', ''];
+        return [['Account Code', 'Account Name', 'Total Debits', 'Total Credits', 'Debit Balance', 'Credit Balance'], $out];
+    });
+    $add("02_general_ledger_detail_$fy.csv", function () use ($q, $d1, $d2) {
+        $rr = $q("SELECT ledger_date, jv_number, coa_code, account_name, description, COALESCE(debit_amount,0) AS dr, COALESCE(credit_amount,0) AS cr, COALESCE(project_code,'') AS pc, COALESCE(posted_by,'') AS pb FROM general_ledger WHERE ledger_date BETWEEN ? AND ? ORDER BY ledger_date, jv_number", [$d1, $d2]);
+        return [['Date', 'Voucher', 'Account', 'Account Name', 'Description', 'Debit', 'Credit', 'Project', 'Posted By'], array_map('array_values', $rr)];
+    });
+    $add("03_income_expenditure_$fy.csv", function () use ($q, $d1, $d2) {
+        $rr = $q("SELECT coa_code, COALESCE(MAX(account_name),'') AS nm, ROUND(SUM(CASE WHEN coa_code LIKE '4%' THEN COALESCE(credit_amount,0)-COALESCE(debit_amount,0) ELSE COALESCE(debit_amount,0)-COALESCE(credit_amount,0) END),2) AS amt FROM general_ledger WHERE (coa_code LIKE '4%' OR coa_code LIKE '6%') AND ledger_date BETWEEN ? AND ? GROUP BY coa_code ORDER BY coa_code", [$d1, $d2]);
+        return [['Account', 'Name', 'Amount (income +, expenditure +)'], array_map('array_values', $rr)];
+    });
+    $add("04_financial_position_$fy.csv", function () use ($q, $d2) {
+        $rr = $q("SELECT COALESCE(c.account_type,'(unclassified)') AS typ, COALESCE(NULLIF(gl.coa_code,''),c.code,'') AS code, COALESCE(MAX(gl.account_name),'') AS nm, ROUND(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),2) AS net FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id WHERE gl.ledger_date <= ? GROUP BY gl.coa_id ORDER BY typ, code", [$d2]);
+        return [['Account Type', 'Code', 'Name', 'Net (Dr-Cr)'], array_map('array_values', $rr)];
+    });
+    $add("05_receivables_aging.csv", function () use ($q) {
+        $rr = $q("SELECT c.customer_name AS nm, ROUND(SUM(i.total_ghs-COALESCE(i.amount_received,0)),2) AS outstanding, COUNT(*) AS invoices FROM ar_invoices i JOIN ar_customers c ON c.id=i.customer_id WHERE i.status IN ('Posted','Part-Paid') AND (i.total_ghs-COALESCE(i.amount_received,0))>0.01 GROUP BY c.id ORDER BY outstanding DESC");
+        return [['Customer', 'Outstanding (GHS)', 'Open Invoices'], array_map('array_values', $rr)];
+    });
+    $add("06_payables_aging.csv", function () use ($q) {
+        $rr = $q("SELECT v.vendor_name AS nm, ROUND(SUM(b.total_ghs-COALESCE(b.amount_paid,0)),2) AS outstanding, COUNT(*) AS bills FROM ap_bills b JOIN vendors v ON v.id=b.vendor_id WHERE b.status IN ('Posted','Part-Paid') AND (b.total_ghs-COALESCE(b.amount_paid,0))>0.01 GROUP BY v.id ORDER BY outstanding DESC");
+        return [['Vendor', 'Outstanding (GHS)', 'Open Bills'], array_map('array_values', $rr)];
+    });
+    $add("07_ppe_register.csv", function () use ($q) {
+        $rr = $q("SELECT asset_code, asset_name, asset_category, acquisition_date, ROUND(COALESCE(acquisition_cost,0),2) AS cost, ROUND(COALESCE(accumulated_depreciation,0),2) AS accdep, ROUND(COALESCE(carrying_amount,0),2) AS nbv, COALESCE(status,'') AS st FROM asset_register ORDER BY asset_code");
+        return [['Code', 'Name', 'Category', 'Acquired', 'Cost', 'Accum Dep', 'Carrying', 'Status'], array_map('array_values', $rr)];
+    });
+    $add("08_tax_schedules_$fy.csv", function () use ($q, $d2) {
+        $codes = ['21100014' => 'WHT', '21100024' => 'WHVAT', '21100017' => 'PAYE', '21100015' => 'SSNIT', '21100027' => 'UCF', '21100022' => 'VAT'];
+        $out = [];
+        foreach ($codes as $code => $label) {
+            $r = $q("SELECT ROUND(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),2) AS bal FROM general_ledger WHERE coa_code=? AND ledger_date <= ?", [$code, $d2]);
+            $out[] = [$code, $label, $r[0]['bal'] ?? 0];
+        }
+        return [['Account', 'Tax', 'Outstanding (GHS)'], $out];
+    });
+    $add("09_budget_vs_actual_$fy.csv", function () use ($q, $d1, $d2) {
+        $rr = $q("SELECT b.budget_code, COALESCE(c.code,'') AS coa, COALESCE(c.account_name,'') AS nm, ROUND(COALESCE(b.budget_ghs,0),2) AS budget, ROUND(COALESCE((SELECT SUM(a.amount_ghs) FROM actuals a WHERE a.budget_id=b.id AND COALESCE(a.is_posted,0)=1 AND a.expense_date BETWEEN ? AND ?),0),2) AS actual FROM budgets b LEFT JOIN chart_of_accounts c ON c.id=b.coa_id WHERE COALESCE(b.is_deleted,0)=0 ORDER BY coa", [$d1, $d2]);
+        return [['Budget', 'Account', 'Name', 'Budget (GHS)', 'Actual (GHS)'], array_map('array_values', $rr)];
+    });
+    $add("10_bank_balances_$fy.csv", function () use ($q, $d2) {
+        $rr = $q("SELECT coa_code, COALESCE(MAX(account_name),'') AS nm, ROUND(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),2) AS bal FROM general_ledger WHERE (coa_code LIKE '126%' OR coa_code LIKE '127%' OR coa_code LIKE '128%' OR coa_code LIKE '129%' OR coa_code='1001') AND ledger_date <= ? GROUP BY coa_code ORDER BY coa_code", [$d2]);
+        return [['Account', 'Name', 'Balance (GHS)'], array_map('array_values', $rr)];
+    });
+    $add("11_audit_log.csv", function () use ($q) {
+        $has = db()->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log'")->fetchColumn();
+        if (!$has) return [['Timestamp', 'Action', 'By', 'Details'], []];
+        $cols = array_column(db()->query("PRAGMA table_info(audit_log)")->fetchAll(), 'name');
+        $tsc = in_array('timestamp', $cols, true) ? 'timestamp' : (in_array('created_at', $cols, true) ? 'created_at' : "''");
+        $byc = in_array('username', $cols, true) ? 'username' : (in_array('performed_by', $cols, true) ? 'performed_by' : "''");
+        $detc = in_array('details', $cols, true) ? 'details' : "''";
+        $actc = in_array('action', $cols, true) ? 'action' : "''";
+        $rr = $q("SELECT COALESCE($tsc,'') AS ts, COALESCE($actc,'') AS act, COALESCE($byc,'') AS by, COALESCE($detc,'') AS det FROM audit_log ORDER BY ts DESC LIMIT 1000");
+        return [['Timestamp', 'Action', 'By', 'Details'], array_map('array_values', $rr)];
+    });
+    $manifest = "UCC-FMS External Audit Pack\r\nFinancial Year: $fy\r\nGenerated: " . date('Y-m-d H:i') . "\r\n\r\nSections:\r\n";
+    foreach ($sections as $s2) $manifest .= sprintf(" - %s : %s%s\r\n", $s2['name'], $s2['ok'] ? 'OK' : 'FAILED', isset($s2['rows']) ? (' (' . $s2['rows'] . ' rows)') : '');
+    $zip->addFromString('00_INDEX.txt', $manifest);
+    $zip->close(); $data = (string)file_get_contents($tmp); @unlink($tmp);
+    $bad = array_values(array_filter($sections, fn($s2) => !$s2['ok']));
+    ok(['ok' => true, 'fy' => $fy, 'sections' => $sections, 'failed' => array_map(fn($s2) => $s2['name'], $bad),
+        'zip_b64' => base64_encode($data), 'filename' => "audit_pack_$fy.zip", 'bytes' => strlen($data)]);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3e — Financial statements derived from the general ledger: Income &
 // Expenditure, Statement of Financial Position, and Cash Flow. Mirrors the Python
@@ -3329,6 +3416,7 @@ try {
     if ($path === '/api/year-end-status' && $method === 'GET') api_year_end_status();
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
     if ($path === '/api/export-file' && $method === 'POST') api_export_file();
+    if ($path === '/api/audit-pack' && $method === 'GET') api_audit_pack();
     if ($path === '/api/statutory-filings' && $method === 'GET') api_statutory_filings();
     if ($path === '/api/opening-balances/post' && $method === 'POST') api_opening_balances_post();
     if ($path === '/api/withholding-payables' && $method === 'GET') api_withholding_list();
