@@ -201,8 +201,60 @@ function api_security_mfa_verify(): void {
     ok(['sid' => $sid, 'user' => ['username' => $user['username'], 'full_name' => $user['full_name'], 'role' => $user['role'],
         'home_unit_id' => $user['home_unit_id'] ?? null, 'scope' => $user['scope'] ?? null]]);
 }
-function api_dual_control_get(): void { require_auth(); ok(['threshold' => (float)setting_get('dual_control_threshold_ghs', 0)]); }
-function api_dual_control_set(): void { require_role(['Admin']); $d = body(); setting_set('dual_control_threshold_ghs', (float)($d['threshold'] ?? 0)); ok(['threshold' => (float)($d['threshold'] ?? 0)]); }
+function api_dual_control_get(): void { require_auth(); ok(['threshold' => (float)setting_get('dual_control_threshold_ghs', 0), 'threshold_ghs' => (float)setting_get('dual_control_threshold_ghs', 0)]); }
+function api_dual_control_set(): void { require_role(['Admin']); $d = body(); $v = (float)($d['threshold_ghs'] ?? ($d['threshold'] ?? 0)); setting_set('dual_control_threshold_ghs', $v); ok(['threshold' => $v, 'threshold_ghs' => $v]); }
+// ── Lightweight approval workflow: submit a record for approval, list pending
+//    approvals with their steps, and process (approve/reject) a step. Approving an
+//    'actuals' PV parks its withholding at 'Awaiting Posting' until the PV is posted.
+function ensure_approvals(): void {
+    db()->exec("CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY, module TEXT NOT NULL, record_id TEXT NOT NULL, record_code TEXT, amount_ghs REAL DEFAULT 0, unit_code TEXT, project_id TEXT, status TEXT DEFAULT 'Pending', submitted_by TEXT, submitted_at TEXT DEFAULT(datetime('now')), decided_by TEXT, decided_at TEXT, comments TEXT)");
+    db()->exec("CREATE TABLE IF NOT EXISTS approval_steps(id TEXT PRIMARY KEY, approval_id TEXT, step_order INTEGER, approver_role TEXT, approver_user TEXT, status TEXT DEFAULT 'Pending', action_by TEXT, action_at TEXT, comments TEXT)");
+}
+function api_approvals_submit(): void {
+    ensure_approvals(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $module = (string)($d['module'] ?? ''); $rec = (string)($d['record_id'] ?? '');
+    if ($module === '' || $rec === '') err('module and record_id are required');
+    $ex = db()->prepare("SELECT id FROM approvals WHERE module=? AND record_id=?"); $ex->execute([$module, $rec]); $aid = $ex->fetchColumn();
+    if (!$aid) {
+        $aid = uuid4();
+        db()->prepare("INSERT INTO approvals(id,module,record_id,amount_ghs,status,submitted_by) VALUES(?,?,?,?,'Pending',?)")
+            ->execute([$aid, $module, $rec, round((float)($d['amount_ghs'] ?? 0), 2), $u['username']]);
+    }
+    $sq = db()->prepare("SELECT id FROM approval_steps WHERE approval_id=?"); $sq->execute([$aid]);
+    $sid = $sq->fetchColumn();
+    if (!$sid) { $sid = uuid4(); db()->prepare("INSERT INTO approval_steps(id,approval_id,step_order,approver_role,status) VALUES(?,?,1,'Approver','Pending')")->execute([$sid, $aid]); }
+    ok(['id' => $aid, 'approval_id' => $aid, 'step_id' => $sid]);
+}
+function api_approvals_list(): void {
+    ensure_approvals(); require_auth();
+    $rows = db()->query("SELECT * FROM approvals ORDER BY submitted_at DESC")->fetchAll();
+    foreach ($rows as &$r) { $s = db()->prepare("SELECT * FROM approval_steps WHERE approval_id=? ORDER BY step_order"); $s->execute([$r['id']]); $r['steps'] = $s->fetchAll(); }
+    unset($r);
+    ok(['approvals' => $rows, 'rows' => $rows]);
+}
+function api_approvals_process(): void {
+    ensure_approvals(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $apid = (string)($d['approval_id'] ?? ''); $stid = (string)($d['step_id'] ?? ''); $action = (string)($d['action'] ?? 'Approve');
+    if ($apid === '') err('approval_id is required');
+    $aq = db()->prepare("SELECT * FROM approvals WHERE id=?"); $aq->execute([$apid]); $ap = $aq->fetch(); if (!$ap) err('Approval not found');
+    $new = stripos($action, 'reject') !== false ? 'Rejected' : 'Approved';
+    if ($stid !== '') db()->prepare("UPDATE approval_steps SET status=?, action_by=?, action_at=datetime('now') WHERE id=?")->execute([$new, $u['username'], $stid]);
+    else db()->prepare("UPDATE approval_steps SET status=?, action_by=?, action_at=datetime('now') WHERE approval_id=? AND status='Pending'")->execute([$new, $u['username'], $apid]);
+    $pq = db()->prepare("SELECT COUNT(*) FROM approval_steps WHERE approval_id=? AND status='Pending'"); $pq->execute([$apid]); $stillPending = (int)$pq->fetchColumn();
+    $rq = db()->prepare("SELECT COUNT(*) FROM approval_steps WHERE approval_id=? AND status='Rejected'"); $rq->execute([$apid]); $rejected = (int)$rq->fetchColumn();
+    $finalStatus = $rejected > 0 ? 'Rejected' : ($stillPending === 0 ? 'Approved' : 'Pending');
+    db()->prepare("UPDATE approvals SET status=?, decided_by=?, decided_at=datetime('now') WHERE id=?")->execute([$finalStatus, $u['username'], $apid]);
+    // On full approval of a PV, park its withholding at 'Awaiting Posting' (created here,
+    // promoted to Pending when the voucher is actually posted).
+    if ($finalStatus === 'Approved' && in_array((string)$ap['module'], ['actuals', 'pv', 'payment_voucher'], true)) {
+        $av = db()->prepare("SELECT * FROM actuals WHERE id=?"); $av->execute([$ap['record_id']]); $a = $av->fetch();
+        if ($a) {
+            $t = ['wht' => (float)($a['wht_amount'] ?? 0), 'whvat' => (float)($a['whvat_amount'] ?? 0), 'ucf' => (float)($a['ucf_amount'] ?? 0)];
+            try { create_withholding_payables((string)$ap['record_id'], $a, $t, null, $u, 'Awaiting Posting'); } catch (Throwable $e) {}
+        }
+    }
+    ok(['approval_id' => $apid, 'status' => $finalStatus, 'step_status' => $new]);
+}
 function api_logout(): void {
     $sid = sid_from_request();
     if ($sid) db()->prepare('DELETE FROM php_sessions WHERE sid=?')->execute([$sid]);
@@ -3407,13 +3459,34 @@ function ensure_wh_table(): void {
     // The table may pre-exist from the Python seed without these columns.
     ensure_col('withholding_payables', 'settled_jv');
     ensure_col('withholding_payables', 'settlement_jv_id');
+    ensure_wh_status();
+}
+// The seed's withholding_payables limits status to Pending/Paid/Cancelled. Widen the
+// CHECK (rebuild, preserving columns/data/UNIQUE) so the approval lifecycle can park a
+// payable at 'Awaiting Posting' before the source voucher is posted. Idempotent.
+function ensure_wh_status(): void {
+    $ddl = db()->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='withholding_payables'")->fetchColumn();
+    if (!$ddl || stripos($ddl, 'Awaiting Posting') !== false || stripos($ddl, 'status IN') === false) return;
+    $new = preg_replace_callback('/status\s+TEXT\s+DEFAULT\s+\'Pending\'\s+CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)\s*\)/i',
+        fn($m) => "status TEXT DEFAULT 'Pending' CHECK(status IN (" . $m[1] . ",'Awaiting Posting','Settled','Remitted'))", $ddl, 1);
+    if (!$new || $new === $ddl) return;
+    $newDDL = preg_replace('/CREATE TABLE\s+["`]?withholding_payables["`]?/i', 'CREATE TABLE wh_new', $new, 1);
+    if (!$newDDL || $newDDL === $new) return;
+    $cols = implode(',', array_map(fn($c) => $c['name'], db()->query("PRAGMA table_info(withholding_payables)")->fetchAll()));
+    try {
+        db()->exec('PRAGMA foreign_keys=OFF');
+        db()->exec($newDDL);
+        db()->exec("INSERT INTO wh_new ($cols) SELECT $cols FROM withholding_payables");
+        db()->exec("DROP TABLE withholding_payables");
+        db()->exec("ALTER TABLE wh_new RENAME TO withholding_payables");
+    } catch (Throwable $e) { /* keep original on any failure */ }
 }
 // Maintain the withholding subledger for a PV (single- or multi-line). UPSERT keyed
 // on (actual_id, payable_type): create on first post, update IN PLACE on a re-post
 // (same row id, so an edited rate flows through), cancel when an edit removes the
 // deduction. A settled (Remitted/Paid) payable is never silently overwritten — edits
 // to such a voucher are blocked upstream.
-function create_withholding_payables(string $aid, array $a, array $t, ?string $jvnum, array $u): void {
+function create_withholding_payables(string $aid, array $a, array $t, ?string $jvnum, array $u, string $status = 'Pending'): void {
     ensure_wh_table();
     $defs = [['WHT', round((float)($t['wht'] ?? 0), 2), ['2030'], 'WHT Payable (' . ($a['wht_type'] ?? '') . ')', 'Ghana Revenue Authority'],
              ['WHVAT', round((float)($t['whvat'] ?? 0), 2), ['2031', '2034'], 'WHVAT Payable', 'Ghana Revenue Authority'],
@@ -3426,11 +3499,14 @@ function create_withholding_payables(string $aid, array $a, array $t, ?string $j
         if ($amt > 0) {
             $coa = get_coa($codes); if (!$coa) continue;
             if ($row && !$isSettled) {
-                db()->prepare("UPDATE withholding_payables SET amount_ghs=?, source_pv_number=?, payable_label=?, coa_id=?, status=CASE WHEN status='Cancelled' THEN 'Pending' ELSE status END WHERE id=?")
-                    ->execute([$amt, $jvnum, $label, $coa['id'], $row['id']]);
+                // Update amount in place; a re-post (status='Pending') also promotes an
+                // Awaiting-Posting/ Cancelled row to live, an approval (status='Awaiting
+                // Posting') leaves an already-live Pending row untouched.
+                db()->prepare("UPDATE withholding_payables SET amount_ghs=?, source_pv_number=?, payable_label=?, coa_id=?, status=CASE WHEN status IN ('Cancelled','Awaiting Posting') THEN ? ELSE status END WHERE id=?")
+                    ->execute([$amt, $jvnum, $label, $coa['id'], $status, $row['id']]);
             } elseif (!$row) {
-                db()->prepare("INSERT INTO withholding_payables(id,actual_id,source_pv_number,payable_type,payable_label,beneficiary,coa_id,project_id,amount_ghs,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,'Pending',?)")
-                    ->execute([uuid4(), $aid, $jvnum, $type, $label, $benef, $coa['id'], $a['project_id'] ?? null, $amt, $u['username']]);
+                db()->prepare("INSERT INTO withholding_payables(id,actual_id,source_pv_number,payable_type,payable_label,beneficiary,coa_id,project_id,amount_ghs,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+                    ->execute([uuid4(), $aid, $jvnum, $type, $label, $benef, $coa['id'], $a['project_id'] ?? null, $amt, $status, $u['username']]);
             }
         } elseif ($row && !$isSettled) {
             db()->prepare("UPDATE withholding_payables SET status='Cancelled' WHERE id=?")->execute([$row['id']]);
@@ -3883,6 +3959,9 @@ try {
         }
     }
     if ($path === '/healthz') { try { db()->query('SELECT 1'); ok(['status' => 'ok', 'db' => 'ok', 'app' => 'UCC-FMS-PHP']); } catch (Throwable $e) { send(['ok' => false, 'db' => 'error'], 503); } }
+    // One-time schema widenings, run at a clean entry point (no open cursors) so the
+    // table rebuilds never collide with a mid-transaction handler. Cheap once applied.
+    if ($path !== '/healthz' && $path !== '/api/login') { try { ensure_wh_status(); } catch (Throwable $e) {} }
     if ($path === '/api/login'  && $method === 'POST') api_login();
     if ($path === '/api/logout' && $method === 'POST') api_logout();
     if ($path === '/api/me'     && $method === 'GET')  api_me();
@@ -3894,8 +3973,11 @@ try {
     // Auditor accounts are strictly read-only: block every write (POST) past the auth
     // endpoints with a clear message, while GET reports and exports stay available.
     if ($method === 'POST') { $au = current_user(); if ($au && ($au['role'] ?? '') === 'Auditor') err('This account is read-only (Auditor) — writes are not permitted', 403); }
-    if ($path === '/api/settings/dual-control' && $method === 'GET') api_dual_control_get();
-    if ($path === '/api/settings/dual-control' && $method === 'POST') api_dual_control_set();
+    if (($path === '/api/settings/dual-control' || $path === '/api/dual-control') && $method === 'GET') api_dual_control_get();
+    if (($path === '/api/settings/dual-control' || $path === '/api/dual-control') && $method === 'POST') api_dual_control_set();
+    if ($path === '/api/approvals' && $method === 'GET') api_approvals_list();
+    if ($path === '/api/approvals/submit' && $method === 'POST') api_approvals_submit();
+    if ($path === '/api/approvals/process' && $method === 'POST') api_approvals_process();
     if ($path === '/api/org-units' && $method === 'GET') api_org_units();
 
     // Phase 5 — master-data create (parallel-run support)
