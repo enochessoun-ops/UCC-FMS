@@ -1076,7 +1076,7 @@ function post_journal(array $user, string $jv_type, string $date, string $period
         VALUES(?,?,?,?,?,?,?,?,?,?,?,'Posted',?,?,datetime('now'),1,?,?,?,?)")
         ->execute([$jid, $jvnum, $jv_type, $date, $period, $desc, $desc, 'GHS', 1.0, $tdr, $tcr,
             $user['username'], $user['username'], $source_module, $source_id, $desc, $unit]);
-    $li = db()->prepare("INSERT INTO jv_lines(id,jv_id,line_number,coa_id,description,debit_amount,credit_amount,project_id) VALUES(?,?,?,?,?,?,?,?)");
+    $li = db()->prepare("INSERT INTO jv_lines(id,jv_id,line_number,coa_id,description,debit_amount,credit_amount,project_id,unit_id) VALUES(?,?,?,?,?,?,?,?,?)");
     $gi = db()->prepare("INSERT INTO general_ledger
         (id,jv_id,jv_number,jv_line_id,ledger_date,period,coa_id,coa_code,account_name,description,
          debit_amount,credit_amount,project_id,posted_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
@@ -1087,7 +1087,7 @@ function post_journal(array $user, string $jv_type, string $date, string $period
         $c = db()->prepare('SELECT code, account_name FROM chart_of_accounts WHERE id=?');
         $c->execute([$l['coa_id']]); $coa = $c->fetch();
         $li->execute([$lid, $jid, $n, $l['coa_id'], (string)($l['description'] ?? $desc),
-            money($l['debit_amount'] ?? 0), money($l['credit_amount'] ?? 0), $l['project_id'] ?? null]);
+            money($l['debit_amount'] ?? 0), money($l['credit_amount'] ?? 0), $l['project_id'] ?? null, ($l['unit_id'] ?? null) ?: $unit]);
         $gi->execute([uuid4(), $jid, $jvnum, $lid, $date, $period, $l['coa_id'],
             $coa['code'] ?? '', $coa['account_name'] ?? '', (string)($l['description'] ?? $desc),
             money($l['debit_amount'] ?? 0), money($l['credit_amount'] ?? 0), $l['project_id'] ?? null,
@@ -1733,7 +1733,7 @@ function api_depreciation_run(): void {
     $expC = get_coa(['61900011', '619']); $accC = get_coa(['11902004', '119']);
     $rows = dep_rows();
     if ($rows && (!$expC || !$accC)) err('Depreciation accounts (expense 619 / accumulated 119) missing from COA');
-    $posted = 0; $total = 0.0; $unit = null;
+    $posted = 0; $total = 0.0; $byUnit = [];
     $ins = db()->prepare("INSERT INTO depreciation_runs(id,run_month,asset_id,asset_code,monthly_dep,accumulated_after,run_by) VALUES(?,?,?,?,?,?,?)");
     foreach ($rows as $r) {
         if ($r['monthly'] <= 0) continue;
@@ -1741,19 +1741,23 @@ function api_depreciation_run(): void {
         db()->prepare('UPDATE asset_register SET accumulated_depreciation=?, carrying_amount=? WHERE id=?')
             ->execute([$newAccum, round($r['cost'] - $newAccum, 2), $r['id']]);
         $ins->execute([uuid4(), $month, $r['id'], $r['asset_code'], $r['monthly'], $newAccum, $u['username']]);
-        $posted++; $total += $r['monthly']; if (!$unit) $unit = $r['unit_id'];
+        $posted++; $total += $r['monthly']; $bk = $r['unit_id'] ?: ''; $byUnit[$bk] = round(($byUnit[$bk] ?? 0) + $r['monthly'], 2);
     }
     $total = round($total, 2);
     $jvnum = null;
     if ($total > 0.005) {
         $ledger_date = (strlen($month) === 7) ? ($month . '-28') : date('Y-m-d');
-        $lines = [
-            ['coa_id' => $expC['id'], 'debit_amount' => $total, 'credit_amount' => 0, 'description' => "Depreciation $month"],
-            ['coa_id' => $accC['id'], 'debit_amount' => 0, 'credit_amount' => $total, 'description' => "Accumulated depreciation $month"],
-        ];
+        // Per-unit depreciation: Dr expense / Cr accumulated, each leg stamped to the
+        // asset's unit so per-unit SFP/I&E carry their own depreciation (was first-asset's unit).
+        $lines = []; $fallback = resolve_write_unit($u, $d);
+        foreach ($byUnit as $uid => $amt) {
+            if ($amt <= 0) continue; $uu = $uid !== '' ? $uid : $fallback;
+            $lines[] = ['coa_id' => $expC['id'], 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => "Depreciation $month", 'unit_id' => $uu];
+            $lines[] = ['coa_id' => $accC['id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => "Accumulated depreciation $month", 'unit_id' => $uu];
+        }
         try {
             [$jid, $jvnum] = post_journal($u, 'JV', $ledger_date, substr($ledger_date, 0, 7),
-                "Monthly depreciation $month ($posted assets)", $lines, 'asset_depreciation', $month, $unit ?: resolve_write_unit($u, $d));
+                "Monthly depreciation $month ($posted assets)", $lines, 'asset_depreciation', $month, $fallback);
         } catch (Throwable $e) { err('Depreciation GL posting failed: ' . $e->getMessage()); }
     }
     ok(['status' => 'Posted', 'month' => $month, 'assets' => $posted, 'total' => $total, 'jv_number' => $jvnum]);
@@ -3904,8 +3908,25 @@ function api_payroll_approve(): void {
     $id_paye = $pcoa('21100017', '2010'); $id_ssn = $pcoa('21100015', '2011');
     $id_t2 = $pcoa('21100021', '2012'); $id_ded = $pcoa('21100021', '2038'); $id_net = $pcoa('21200005', '21100021', '2036');
     if (!$id_sal || !$id_paye || !$id_ssn || !$id_net) err('Payroll GL accounts missing from chart of accounts');
-    $lines = [['coa_id' => $id_sal, 'debit_amount' => $gross_basic, 'credit_amount' => 0, 'description' => "Salaries & wages $month"]];
-    if ($empr_ssnit > 0 && $id_ssx) $lines[] = ['coa_id' => $id_ssx, 'debit_amount' => $empr_ssnit, 'credit_amount' => 0, 'description' => "Employer SSNIT $month"];
+    // Salary + employer-SSNIT expense (Dr) split BY UNIT so each school/centre carries its
+    // own staff cost in unit-scoped reports (was posted entirely to the Central root). The
+    // liability/net-pay credits stay at institution level. Credits are balanced to the
+    // actual posted debit total (absorbs any per-unit rounding).
+    $lines = []; $dtot = 0.0;
+    $bu = db()->prepare("SELECT unit_id, COALESCE(SUM(gross_pay),0) AS sal, COALESCE(SUM(employer_tier1),0)+COALESCE(SUM(employer_tier2),0) AS essx FROM payroll_register WHERE payroll_month=? AND status='Approved' GROUP BY unit_id");
+    $bu->execute([$month]);
+    foreach ($bu->fetchAll() as $ur) {
+        $usal = round((float)$ur['sal'], 2); $uessx = round((float)$ur['essx'], 2); $uu = $ur['unit_id'] ?: null;
+        if ($usal != 0.0) { $lines[] = ['coa_id' => $id_sal, 'debit_amount' => $usal, 'credit_amount' => 0, 'description' => "Salaries & wages $month", 'unit_id' => $uu]; $dtot += $usal; }
+        if ($uessx != 0.0 && $id_ssx) { $lines[] = ['coa_id' => $id_ssx, 'debit_amount' => $uessx, 'credit_amount' => 0, 'description' => "Employer SSNIT $month", 'unit_id' => $uu]; $dtot += $uessx; }
+    }
+    if (!$lines) { // no per-unit data — fall back to the single aggregate debit lines
+        $lines[] = ['coa_id' => $id_sal, 'debit_amount' => $gross_basic, 'credit_amount' => 0, 'description' => "Salaries & wages $month"];
+        if ($empr_ssnit > 0 && $id_ssx) $lines[] = ['coa_id' => $id_ssx, 'debit_amount' => $empr_ssnit, 'credit_amount' => 0, 'description' => "Employer SSNIT $month"];
+        $dtot = round($gross_basic + $empr_ssnit, 2);
+    }
+    $cost = round($dtot, 2);                                   // posted debit total is authoritative
+    $net = round($cost - round($paye + $ssnit + $tier2 + $ded, 2), 2); // net pay balances the JV
     if ($paye > 0) $lines[] = ['coa_id' => $id_paye, 'debit_amount' => 0, 'credit_amount' => $paye, 'description' => 'PAYE payable (GRA)'];
     if ($ssnit > 0) $lines[] = ['coa_id' => $id_ssn, 'debit_amount' => 0, 'credit_amount' => $ssnit, 'description' => 'SSNIT Tier 1 payable'];
     if ($tier2 > 0) $lines[] = ['coa_id' => $id_t2, 'debit_amount' => 0, 'credit_amount' => $tier2, 'description' => 'Tier 2 pension payable'];
