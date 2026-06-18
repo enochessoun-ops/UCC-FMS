@@ -82,6 +82,10 @@ been run for the main path: login → dashboard renders with live data, zero con
 errors, and every SPA list endpoint the UI iterates (`departments`, `dept-summary`,
 `vendors`, `approvals`, `fuel-vehicles`, `procure-to-pay`, `attachments`, …) now
 returns the bare-array shape the SPA expects (these were added/aligned during QA).
-Remaining before a hard cut-over: a full click-through of every leaf view, load/perf
-profiling, and SMTP wiring for the email/dunning/remittance features (they queue
-gracefully when SMTP is off).
+A full click-through of **all ~40 SPA views** (driven via the SPA's own `nav()`
+router) now renders with **zero console errors** against the PHP backend — several
+view feeds (fuel-coupons, fx-rates, audit, payroll months/employees/settings,
+quarterly-budgets, budget-periods, budget-uploads, departments, procure-to-pay,
+vendors, approvals) were added/shape-aligned to the bare-array/object shapes the SPA
+expects. Remaining before a hard cut-over: load/perf profiling, and SMTP wiring for
+the email/dunning/remittance features (they queue gracefully when SMTP is off).
