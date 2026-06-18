@@ -1,6 +1,17 @@
 # PHP Port Plan — UCC-FMS & AOI-FMS
-_Phase-governed re-implementation of the backend in PHP, with the existing 60-check verification
+_Phase-governed re-implementation of the backend in PHP, with the existing verification
 suite as the binding acceptance contract. Drafted 2026-06-11._
+
+> **STATUS 2026-06-18 — UCC-FMS PHP port COMPLETE against the gate.** `php/index.php`
+> (single front controller) now passes **regression_fixes.py 78/78** and **smoke_test.py 11/11** —
+> behavioural parity with the Python reference on the full finance-correctness contract
+> (balanced postings, SFP/I&E/cash-flow ties, Ghana tax math, the withholding lifecycle incl.
+> approval→Awaiting-Posting→Pending and remittance reversal, multiline-PV edit-in-place,
+> petty-cash corrections, year-end close, FX, depreciation/PPE, P2P, audit pack, TOTP MFA,
+> Auditor read-only, tamper-evident audit chain, bank-rec clearing, exports). Deploy guide:
+> **`php/DEPLOY_PHP.md`** (cPanel/Apache + `php/.htaccess`). Remaining = non-gate: SPA
+> click-through QA on the PHP backend, perf profiling, SMTP wiring. (The original "60-check"
+> count grew to 78 as the suite added lifecycle sub-checks that only execute once the engine is correct.)
 
 ## Why this is tractable
 1. **The entire user interface carries over unchanged.** `index.html` is a self-contained SPA that

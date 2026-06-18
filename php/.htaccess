@@ -1,0 +1,22 @@
+# UCC-FMS PHP port — Apache / cPanel front-controller routing.
+# The single front controller (index.php) serves the SPA (index.html), static
+# assets, and the whole /api surface. Route every request that is not already
+# index.php to it; index.php then dispatches (SPA / assets / API). This mirrors
+# what `php -S 127.0.0.1:PORT php/index.php` does in development.
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # Send everything through the front controller (preserve the query string).
+    RewriteCond %{REQUEST_URI} !=/index.php
+    RewriteRule ^ index.php [QSA,L]
+</IfModule>
+
+# Defence in depth: never serve the SQLite database or dotfiles over HTTP, even if
+# they end up inside the web root. Keep the .db OUTSIDE the docroot in production.
+<FilesMatch "\.(db|db-wal|db-shm|sqlite|sqlite3|htaccess|user\.ini)$">
+    Require all denied
+</FilesMatch>
+
+# Suppress PHP error output at the server level too (index.php also sets this).
+php_flag display_errors off
+php_flag log_errors on
