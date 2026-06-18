@@ -1095,7 +1095,8 @@ function api_ar_customer_save(): void {
 function api_ar_invoices_list(): void {
     ensure_arap_tables(); $u = require_auth();
     [$sw, $sp] = unit_scope_sql($u, 'ar_invoices', $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
-    $st = db()->prepare("SELECT ar_invoices.* FROM ar_invoices WHERE 1=1$sw ORDER BY created_at DESC");
+    ensure_col('ar_invoices', 'amount_received', 'REAL');
+    $st = db()->prepare("SELECT ar_invoices.*, ROUND(COALESCE(total_ghs,0)-COALESCE(amount_received,0),2) AS balance_ghs FROM ar_invoices WHERE 1=1$sw ORDER BY created_at DESC");
     $st->execute($sp); send(['ok' => true, 'invoices' => $st->fetchAll()]);
 }
 function api_ar_invoice_save(): void {
@@ -1156,20 +1157,35 @@ function api_ar_customer_statement(): void {
 function api_ap_bills_list(): void {
     ensure_arap_tables(); $u = require_auth();
     [$sw, $sp] = unit_scope_sql($u, 'ap_bills', $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
-    $st = db()->prepare("SELECT ap_bills.* FROM ap_bills WHERE 1=1$sw ORDER BY created_at DESC");
+    ensure_col('ap_bills', 'amount_paid', 'REAL');
+    $st = db()->prepare("SELECT ap_bills.*, ROUND(COALESCE(total_ghs,0)-COALESCE(amount_paid,0),2) AS balance_ghs FROM ap_bills WHERE 1=1$sw ORDER BY created_at DESC");
     $st->execute($sp); send(['ok' => true, 'bills' => $st->fetchAll()]);
 }
 function api_ap_bill_save(): void {
     ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
     if (empty($d['vendor_id'])) err('vendor_id is required');
-    if (empty($d['expense_coa_id'])) err('expense_coa_id is required');
-    $amount = round((float)($d['amount_ghs'] ?? 0), 2); $tax = round((float)($d['tax_ghs'] ?? 0), 2); $total = round($amount + $tax, 2);
+    // Accept either a multi-line bill (lines[]) — the shape the UI/gate sends — or a
+    // single top-level expense_coa_id/amount_ghs (legacy).
+    $blines = (isset($d['lines']) && is_array($d['lines']) && $d['lines']) ? $d['lines'] : null;
+    if ($blines) {
+        $first_coa = $blines[0]['expense_coa_id'] ?? null;
+        if (!$first_coa) err('Each bill line needs an expense_coa_id');
+        $amount = 0.0; foreach ($blines as $l) $amount += (float)($l['amount_ghs'] ?? 0);
+        $amount = round($amount, 2);
+    } else {
+        if (empty($d['expense_coa_id'])) err('expense_coa_id is required');
+        $first_coa = $d['expense_coa_id'];
+        $amount = round((float)($d['amount_ghs'] ?? 0), 2);
+        $blines = [['expense_coa_id' => $first_coa, 'amount_ghs' => $amount, 'description' => $d['description'] ?? '']];
+    }
+    $tax = round((float)($d['tax_ghs'] ?? 0), 2); $total = round($amount + $tax, 2);
     if ($amount <= 0) err('Bill amount must be greater than zero');
     require_write_unit($u, $d, 'AP bill');
     $id = uuid4(); $num = $d['bill_number'] ?? seq_code('ap_bills', 'bill_number', 'BILL-', 4); $unit = resolve_write_unit($u, $d);
     db()->prepare("INSERT INTO ap_bills(id,bill_number,vendor_invoice_no,vendor_id,bill_date,due_date,project_id,expense_coa_id,description,amount_ghs,tax_ghs,total_ghs,status,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Draft',?,?)")
-        ->execute([$id, $num, $d['vendor_invoice_no'] ?? '', $d['vendor_id'], $d['bill_date'] ?? date('Y-m-d'), $d['due_date'] ?? null, $d['project_id'] ?? null, $d['expense_coa_id'], $d['description'] ?? '', $amount, $tax, $total, $u['username'], $unit]);
-    db()->prepare('INSERT INTO ap_bill_lines(id,bill_id,line_number,description,expense_coa_id,amount_ghs) VALUES(?,?,1,?,?,?)')->execute([uuid4(), $id, $d['description'] ?? '', $d['expense_coa_id'], $amount]);
+        ->execute([$id, $num, $d['vendor_invoice_no'] ?? '', $d['vendor_id'], $d['bill_date'] ?? date('Y-m-d'), $d['due_date'] ?? null, $d['project_id'] ?? null, $first_coa, $d['description'] ?? '', $amount, $tax, $total, $u['username'], $unit]);
+    $ln = 0; $bli = db()->prepare('INSERT INTO ap_bill_lines(id,bill_id,line_number,description,expense_coa_id,amount_ghs) VALUES(?,?,?,?,?,?)');
+    foreach ($blines as $l) { $ln++; $bli->execute([uuid4(), $id, $ln, $l['description'] ?? '', $l['expense_coa_id'], round((float)($l['amount_ghs'] ?? 0), 2)]); }
     ok(['id' => $id, 'bill_number' => $num]);
 }
 function api_ap_bill_post(): void {
@@ -1188,6 +1204,57 @@ function api_ap_bill_post(): void {
     catch (Throwable $e) { err('Could not post bill: ' . $e->getMessage()); }
     db()->prepare("UPDATE ap_bills SET status='Posted', jv_id=?, jv_number=?, posted_at=datetime('now') WHERE id=?")->execute([$jid, $jvnum, $bid]);
     ok(['id' => $bid, 'jv_number' => $jvnum, 'status' => 'Posted', 'total' => $total]);
+}
+
+// ── AR receipt (Dr Bank / Cr Receivables) + AP payment (Dr Payables / Cr Bank) ──
+function bank_coa_from_account(?string $bank_account_id): ?string {
+    if ($bank_account_id) {
+        $bk = db()->prepare('SELECT coa_id FROM bank_accounts WHERE id=?'); $bk->execute([$bank_account_id]);
+        $c = $bk->fetchColumn(); if ($c) return (string)$c;
+    }
+    $b = operating_bank_coa(); return $b['id'] ?? null;
+}
+function api_ar_receipt(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    ensure_col('ar_invoices', 'amount_received', 'REAL');
+    $iid = (string)($d['invoice_id'] ?? ($d['id'] ?? '')); if ($iid === '') err('invoice_id is required');
+    $amt = round((float)($d['amount_ghs'] ?? 0), 2); if ($amt <= 0) err('Receipt amount must be greater than zero');
+    $st = db()->prepare('SELECT * FROM ar_invoices WHERE id=?'); $st->execute([$iid]); $inv = $st->fetch();
+    if (!$inv) err('Invoice not found');
+    if (($inv['status'] ?? '') === 'Draft') err('Post the invoice before receipting against it');
+    $total = round((float)$inv['total_ghs'], 2); $recd = round((float)($inv['amount_received'] ?? 0), 2); $bal = round($total - $recd, 2);
+    if ($amt > $bal + 0.01) err('Receipt exceeds the outstanding balance of GHS ' . number_format($bal, 2));
+    $bcoa = bank_coa_from_account((string)($d['bank_account_id'] ?? '')); if (!$bcoa) err('Bank account could not be resolved');
+    $ar = ar_control_coa(); if (!$ar) err('No receivables control account in the chart of accounts');
+    $date = (string)($d['receipt_date'] ?? date('Y-m-d'));
+    $lines = [['coa_id' => $bcoa, 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => 'Receipt ' . ($inv['invoice_number'] ?? ''), 'project_id' => $inv['project_id']],
+              ['coa_id' => $ar['id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'AR cleared ' . ($inv['invoice_number'] ?? ''), 'project_id' => $inv['project_id']]];
+    try { [$jid, $jvnum] = post_journal($u, 'RV', $date, substr($date, 0, 7), 'AR receipt ' . ($inv['invoice_number'] ?? ''), $lines, 'ar_receipts', $iid, $inv['unit_id'] ?? null); }
+    catch (Throwable $e) { err('Receipt posting failed: ' . $e->getMessage()); }
+    $newrecd = round($recd + $amt, 2); $newbal = round($total - $newrecd, 2); $status = $newbal <= 0.01 ? 'Paid' : 'Part-Paid';
+    db()->prepare('UPDATE ar_invoices SET amount_received=?, status=? WHERE id=?')->execute([$newrecd, $status, $iid]);
+    ok(['jv_number' => $jvnum, 'status' => $status, 'balance_ghs' => $newbal, 'amount_received' => $newrecd]);
+}
+function api_ap_payment(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    ensure_col('ap_bills', 'amount_paid', 'REAL');
+    $bid = (string)($d['bill_id'] ?? ($d['id'] ?? '')); if ($bid === '') err('bill_id is required');
+    $amt = round((float)($d['amount_ghs'] ?? 0), 2); if ($amt <= 0) err('Payment amount must be greater than zero');
+    $st = db()->prepare('SELECT * FROM ap_bills WHERE id=?'); $st->execute([$bid]); $bill = $st->fetch();
+    if (!$bill) err('Bill not found');
+    if (($bill['status'] ?? '') === 'Draft') err('Post the bill before paying it');
+    $total = round((float)$bill['total_ghs'], 2); $paid = round((float)($bill['amount_paid'] ?? 0), 2); $bal = round($total - $paid, 2);
+    if ($amt > $bal + 0.01) err('Payment exceeds the outstanding balance of GHS ' . number_format($bal, 2));
+    $bcoa = bank_coa_from_account((string)($d['bank_account_id'] ?? '')); if (!$bcoa) err('Bank account could not be resolved');
+    $ap = ap_control_coa(); if (!$ap) err('No payables control account in the chart of accounts');
+    $date = (string)($d['payment_date'] ?? date('Y-m-d'));
+    $lines = [['coa_id' => $ap['id'], 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => 'AP paid ' . ($bill['bill_number'] ?? ''), 'project_id' => $bill['project_id']],
+              ['coa_id' => $bcoa, 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Payment ' . ($bill['bill_number'] ?? ''), 'project_id' => $bill['project_id']]];
+    try { [$jid, $jvnum] = post_journal($u, 'PV', $date, substr($date, 0, 7), 'AP payment ' . ($bill['bill_number'] ?? ''), $lines, 'ap_payments', $bid, $bill['unit_id'] ?? null); }
+    catch (Throwable $e) { err('Payment posting failed: ' . $e->getMessage()); }
+    $newpaid = round($paid + $amt, 2); $newbal = round($total - $newpaid, 2); $status = $newbal <= 0.01 ? 'Paid' : 'Part-Paid';
+    db()->prepare('UPDATE ap_bills SET amount_paid=?, status=? WHERE id=?')->execute([$newpaid, $status, $bid]);
+    ok(['jv_number' => $jvnum, 'status' => $status, 'balance_ghs' => $newbal, 'amount_paid' => $newpaid]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1348,10 +1415,16 @@ function api_sfp(): void {
         FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id
         WHERE (c.code LIKE '127%' OR c.code LIKE '126%') $w");
     $cashq->execute($p); $cash = round((float)$cashq->fetchColumn(), 2);
+    // Withholding (WHT/WHVAT/UCF) control-account balance — shown on its own SFP line.
+    $whtq = db()->prepare("SELECT COALESCE(SUM(gl.credit_amount-gl.debit_amount),0)
+        FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id
+        WHERE c.code IN ('21100014','21100024','21100027','2030','2031','2033') $w");
+    $whtq->execute($p); $wht_held = round((float)$whtq->fetchColumn(), 2);
     send(['ok' => true,
           // Nested shape consumed by the acceptance suite + UI…
           'assets' => ['total' => $assets, 'cash_and_bank' => $cash],
-          'liabilities' => ['total' => $liabilities],
+          'liabilities' => ['total' => $liabilities, 'wht_held' => $wht_held],
+          'equity' => ['contributed' => $equity, 'accumulated_surplus' => $surplus, 'total' => $net_assets],
           'net_assets' => $net_assets, 'accumulated_fund' => $equity, 'surplus_deficit' => $surplus,
           'presentation_difference' => $diff, 'basis' => 'general_ledger', 'balances' => abs($diff) < 0.02,
           // …plus flat keys for convenience.
@@ -2023,9 +2096,11 @@ try {
     if ($path === '/api/ar/invoices' && $method === 'GET') api_ar_invoices_list();
     if ($path === '/api/ar/invoices' && $method === 'POST') api_ar_invoice_save();
     if ($path === '/api/ar/invoices/post' && $method === 'POST') api_ar_invoice_post();
+    if ($path === '/api/ar/receipt' && $method === 'POST') api_ar_receipt();
     if ($path === '/api/ap/bills' && $method === 'GET') api_ap_bills_list();
     if ($path === '/api/ap/bills' && $method === 'POST') api_ap_bill_save();
     if ($path === '/api/ap/bills/post' && $method === 'POST') api_ap_bill_post();
+    if ($path === '/api/ap/payment' && $method === 'POST') api_ap_payment();
 
     // Phase 3d (inventory) — stores ledger
     if ($path === '/api/inv/items' && $method === 'GET') api_inv_items_list();
