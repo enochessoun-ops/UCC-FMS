@@ -2033,9 +2033,15 @@ function donorBar(){
 
 // ── DASHBOARD ────────────────────────────────────────────────────────────
 async function vDash(){
-  const [d, deptSum] = await Promise.all([GET('/api/dashboard'), GET('/api/dept-summary')]);
+  const [d, deptSum, projRes] = await Promise.all([GET('/api/dashboard'), GET('/api/dept-summary'), GET('/api/projects')]);
   if(!d){$('content').innerHTML='<div class="alert alert-error" style="margin:24px">Could not load dashboard.</div>';return;}
   const s=d.stats, depts=deptSum||[];
+  // Research-grant KPIs derived from real project data (the dashboard stats object
+  // carries only the budget/spend roll-up, so s.total_projects was always undefined).
+  const projects=Array.isArray(projRes)?projRes:((projRes&&(projRes.data||projRes.projects))||[]);
+  const projCount=projects.length;
+  const projActive=projects.filter(p=>String(p.status||'').toLowerCase()!=='closed'&&String(p.status||'').toLowerCase()!=='completed').length;
+  const projBudget=projects.reduce((a,p)=>a+(Number(p.budget_ghs||p.budget||0)||0),0);
   const now=new Date();
   const academicYear='2025/2026';
   const sem='Second Semester';
@@ -2090,8 +2096,8 @@ async function vDash(){
         <div class="dash-kpi-sub">${available>=0?'Unspent funds':'Over budget!'}</div></div></div>
     <div class="dash-kpi"><div class="dash-kpi-icon" style="background:#EFF6FF;color:#0891B2">🔬</div>
       <div class="dash-kpi-body"><div class="dash-kpi-lbl">Research Grants</div>
-        <div class="dash-kpi-val">${s.total_projects}</div>
-        <div class="dash-kpi-sub">${s.active_projects} active · ${fmtGHS(s.total_budget_ghs)}</div></div></div>
+        <div class="dash-kpi-val">${projCount}</div>
+        <div class="dash-kpi-sub">${projActive} active · ${fmtGHS(projBudget)}</div></div></div>
   </div>
 
   <div class="dash-util-card">
@@ -7625,20 +7631,24 @@ function _jvUnitOptions(selectedId){
   // Admin / university-scope users have no single home unit, so the picker opens
   // unselected and they choose (the server defaults them to the Central node).
   const eff = selectedId || (S.user && S.user.home_unit_id) || '';
-  if(list.length){
-    // Float the Central / Registry node to the top so it is always an explicit,
-    // easy-to-find choice (e.g. for central postings).
-    const isCentral = u => !u.parent_code || String(u.code||'').toUpperCase()==='REG';
-    const central = list.filter(isCentral);
-    const rest = list.filter(u=>!isCentral(u));
-    const ordered = central.concat(rest);
-    return '<option value="">-- Select Unit / Cost Centre --</option>' + ordered.map(u=>{
-      const id=esc(u.id||u.code||''); const nm=esc(u.name||u.code||'');
-      const ty=u.unit_type?(' ('+esc(u.unit_type)+')'):'';
-      return `<option value="${id}" ${eff&&u.id===eff?'selected':''}>${nm}${ty}</option>`;
-    }).join('');
-  }
-  return '<option value="">-- Select Unit / Cost Centre --</option>';
+  if(!list.length) return '<option value="">-- Select Unit / Cost Centre --</option>';
+  // Hierarchical (tree) rendering: indent each node under its parent so the
+  // College → School/Faculty → Department structure is visible in the picker.
+  // A flat 60-item list was ambiguous when unit names repeat across colleges.
+  const byParent = {};
+  list.forEach(u=>{ const p=u.parent_code||'__ROOT__'; (byParent[p]=byParent[p]||[]).push(u); });
+  const kids = code => (byParent[code]||[]).slice().sort((a,b)=>String(a.name||a.code||'').localeCompare(String(b.name||b.code||'')));
+  let html = '<option value="">-- Select Unit / Cost Centre --</option>';
+  const walk = (node, depth) => {
+    const id=esc(node.id||node.code||''); const nm=esc(node.name||node.code||'');
+    const ty=(node.unit_type&&node.unit_type!=='University')?(' ('+esc(node.unit_type)+')'):'';
+    const pad='   '.repeat(depth) + (depth>0?'└ ':'');
+    html += `<option value="${id}" ${eff&&node.id===eff?'selected':''}>${pad}${nm}${ty}</option>`;
+    kids(node.code).forEach(ch=>walk(ch, depth+1));
+  };
+  const roots = list.filter(u=>!u.parent_code || u.parent_code==='');
+  (roots.length?roots:list).forEach(rt=>walk(rt,0));
+  return html;
 }
 // Hard-require an org unit at submit. Returns true (proceed) when the picker holds a
 // value OR the user is Admin / university-scope (the server attributes them to the
@@ -31066,6 +31076,79 @@ body.dark-mode .ips-chip{background:#1e293b!important;color:#cbd5e1!important;bo
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){ setTimeout(inject,1900); });
   else setTimeout(inject,1900);
   setTimeout(inject,3900);
+})();
+</script>
+<script>
+/* ── Organisation Tree view ───────────────────────────────────────────────────
+   A federated university ERP must let users SEE and navigate the org-unit tree.
+   Previously the 60-unit hierarchy only ever appeared as a flat dropdown and
+   nav('org-units') returned "View not found". This adds a real expandable tree
+   (University → College → School/Faculty → Department / Directorate → Section …)
+   with per-node consolidated financials lazy-loaded from the now unit-scoped
+   /api/dashboard?unit=<code> (subtree roll-up). Self-contained, idempotent. */
+(function(){
+  'use strict';
+  function escx(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function fmtG(n){return 'GHS '+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
+  var TYPE_COLORS={University:'#1A5276',College:'#006B3F',Faculty:'#8B0000',School:'#0060A9',Department:'#6B21A8',Directorate:'#B7791F',Institute:'#0E7490',Centre:'#9A3412',Section:'#374151',Hall:'#7C2D12',IGFUnit:'#065F46',IGF:'#065F46',AdminUnit:'#4B5563'};
+  function badge(t){var col=TYPE_COLORS[t]||'#4B5563';return '<span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;background:'+col+'1A;color:'+col+';border:1px solid '+col+'33">'+escx(t||'Unit')+'</span>';}
+  async function vOrgTree(){
+    var c=document.getElementById('content'); if(c)c.innerHTML='<div class="loading">Loading organisation tree…</div>';
+    var raw; try{ raw=await window.GET('/api/org-units'); }catch(e){ if(c)c.innerHTML='<div class="alert alert-error" style="margin:24px">Could not load organisation units.</div>'; return; }
+    var units=Array.isArray(raw)?raw:((raw&&(raw.units||raw.data))||[]);
+    if(!units.length){ if(c)c.innerHTML='<div class="alert" style="margin:24px">No organisation units defined yet.</div>'; return; }
+    var byParent={}; units.forEach(function(u){var p=u.parent_code||'__ROOT__';(byParent[p]=byParent[p]||[]).push(u);});
+    function kids(code){return (byParent[code]||[]).slice().sort(function(a,b){return String(a.name||a.code||'').localeCompare(String(b.name||b.code||''));});}
+    function descCount(code){var n=0,st=[code];while(st.length){var x=st.pop();(byParent[x]||[]).forEach(function(ch){n++;st.push(ch.code);});}return n;}
+    function nodeHTML(node,depth){
+      var ch=kids(node.code), dc=descCount(node.code);
+      var head=node.head_name?'<span style="color:var(--muted,#64748b);font-size:12px">· '+escx(node.head_name)+(node.head_title?' ('+escx(node.head_title)+')':'')+'</span>':'';
+      var sub=ch.length?'<span style="font-size:11px;color:var(--muted,#64748b)">'+ch.length+' direct · '+dc+' total</span>':'';
+      var summary='<summary class="otree-sum" style="cursor:pointer;padding:8px 10px;border-radius:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+        +'<span style="font-weight:600">'+escx(node.name||node.code)+'</span>'
+        +'<code style="font-size:11px;opacity:.7">'+escx(node.code)+'</code> '+badge(node.unit_type)+' '+head+' '+sub
+        +'<button class="btn btn-ghost btn-xs otree-fin" data-code="'+escx(node.code)+'" type="button" style="margin-left:auto">💰 Financials</button></summary>';
+      var fin='<div class="otree-fin-box" data-for="'+escx(node.code)+'" style="display:none;margin:4px 0 10px 26px;font-size:12px;color:var(--muted,#64748b)"></div>';
+      var childHTML=ch.length?'<div style="margin-left:18px;border-left:1px dashed var(--border,#e2e8f0);padding-left:8px">'+ch.map(function(x){return nodeHTML(x,depth+1);}).join('')+'</div>':'';
+      return '<details'+(depth<1?' open':'')+' style="margin:2px 0">'+summary+fin+childHTML+'</details>';
+    }
+    var roots=units.filter(function(u){return !u.parent_code||u.parent_code==='';});
+    var treeHTML=(roots.length?roots:units).map(function(r){return nodeHTML(r,0);}).join('');
+    if(c)c.innerHTML='<div style="padding:18px 24px"><div style="margin-bottom:14px">'
+      +'<div style="font-size:18px;font-weight:700">Organisation Tree</div>'
+      +'<div style="font-size:13px;color:var(--muted,#64748b)">'+units.length+' units · University → College → School/Faculty → Department. Expand a node to see its sub-units; click 💰 for its consolidated (subtree) financials.</div></div>'
+      +'<div class="card" style="padding:10px 14px">'+treeHTML+'</div></div>';
+    Array.prototype.forEach.call(c.querySelectorAll('.otree-fin'),function(btn){
+      btn.onclick=async function(e){
+        e.preventDefault(); e.stopPropagation();
+        var code=btn.getAttribute('data-code'); var box=null;
+        Array.prototype.forEach.call(c.querySelectorAll('.otree-fin-box'),function(b){ if(b.getAttribute('data-for')===code) box=b; });
+        if(!box)return;
+        if(box.style.display==='block'){box.style.display='none';return;}
+        box.style.display='block'; box.textContent='Loading…';
+        try{ var d=await window.GET('/api/dashboard?unit='+encodeURIComponent(code)); var s=(d&&d.stats)||d||{};
+          box.innerHTML='<b>Subtree roll-up:</b> Budget '+fmtG(s.total_budget)+' · Spent '+fmtG(s.total_spent)+' · Committed '+fmtG(s.total_committed)+' · Received '+fmtG(s.total_received);
+        }catch(err){ box.textContent='Could not load financials.'; }
+      };
+    });
+  }
+  window.vOrgTree=vOrgTree;
+  function installOrgTreeNav(){try{if(document.querySelector('[data-v="org-units"]'))return;var host=document.querySelector('#sidebar .sb-nav,.sb-nav,#sidebar,.side,aside');if(!host)return;var g=document.createElement('div');g.className='nav-group otree-nav';g.innerHTML='<div class="nav-section-title" style="margin-top:12px">STRUCTURE</div><button class="ni" data-v="org-units" type="button">🏛 Organisation Tree</button>';host.appendChild(g);var b=g.querySelector('[data-v="org-units"]');if(b)b.onclick=function(){if(typeof window.nav==='function')window.nav('org-units');};}catch(e){}}
+  function installOrgTreeRoute(){
+    if(window.nav&&window.nav.__otreeRoute)return;
+    var prev=(typeof window.nav==='function')?window.nav:null;
+    var route=function(view){
+      if(view==='org-units'){
+        try{if(window.S)window.S.view=view;document.querySelectorAll('.ni').forEach(function(el){el.classList.toggle('active',el.dataset.v===view);});var t=document.getElementById('tbt');if(t)t.textContent='Organisation Tree';var a=document.getElementById('tba');if(a)a.innerHTML='';}catch(e){}
+        return vOrgTree();
+      }
+      return typeof prev==='function'?prev.apply(this,arguments):undefined;
+    };
+    route.__otreeRoute=true; window.nav=route;
+  }
+  function bootOrgTree(){installOrgTreeRoute();installOrgTreeNav();}
+  if(document.readyState!=='loading')bootOrgTree(); else document.addEventListener('DOMContentLoaded',bootOrgTree);
+  setTimeout(bootOrgTree,1300); setTimeout(installOrgTreeNav,2600);
 })();
 </script>
 </body>
