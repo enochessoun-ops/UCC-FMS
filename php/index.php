@@ -1983,6 +1983,85 @@ function api_rec_journal_generate(): void {
     ok(['generated' => $generated, 'count' => count($posted), 'message' => $posted ? ('Posted ' . count($posted) . ' journal(s)') : 'No journals due']);
 }
 
+// ── Generic export engine: CSV, real XLSX (OOXML via ZipArchive) and PDF from a
+//    {title, subtitle, columns:[{key,label,align}], rows:[{}|[]]} payload.
+function exp_norm(array $d): array {
+    $cols = [];
+    foreach (($d['columns'] ?? []) as $c) {
+        if (is_array($c)) $cols[] = ['key' => $c['key'] ?? ($c['label'] ?? ''), 'label' => $c['label'] ?? ($c['key'] ?? ''), 'align' => $c['align'] ?? 'left'];
+        else $cols[] = ['key' => $c, 'label' => $c, 'align' => 'left'];
+    }
+    $rows = [];
+    foreach (($d['rows'] ?? []) as $r) {
+        if (is_array($r) && $r !== array_values($r)) { $row = []; foreach ($cols as $c) $row[] = $r[$c['key']] ?? ''; $rows[] = $row; }
+        elseif (is_array($r)) $rows[] = array_values($r);
+        else $rows[] = [$r];
+    }
+    return [$cols, $rows];
+}
+function xlsx_col(int $n): string { $s = ''; $n++; while ($n > 0) { $m = ($n - 1) % 26; $s = chr(65 + $m) . $s; $n = intdiv($n - 1, 26); } return $s; }
+function build_xlsx(string $title, array $cols, array $rows): string {
+    $xe = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES | ENT_XML1, 'UTF-8');
+    $sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' . "\n" . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
+    $all = array_merge([array_map(fn($c) => $c['label'], $cols)], $rows); $rn = 0;
+    foreach ($all as $r) {
+        $rn++; $sheet .= '<row r="' . $rn . '">'; $cn = 0;
+        foreach ($r as $v) { $sheet .= '<c r="' . xlsx_col($cn) . $rn . '" t="inlineStr"><is><t xml:space="preserve">' . $xe($v) . '</t></is></c>'; $cn++; }
+        $sheet .= '</row>';
+    }
+    $sheet .= '</sheetData></worksheet>';
+    $ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' . "\n" . '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>';
+    $rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' . "\n" . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+    $wb = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' . "\n" . '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
+    $wbrels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' . "\n" . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>';
+    $tmp = tempnam(sys_get_temp_dir(), 'xlsx'); $zip = new ZipArchive(); $zip->open($tmp, ZipArchive::OVERWRITE);
+    $zip->addFromString('[Content_Types].xml', $ct); $zip->addFromString('_rels/.rels', $rels);
+    $zip->addFromString('xl/workbook.xml', $wb); $zip->addFromString('xl/_rels/workbook.xml.rels', $wbrels);
+    $zip->addFromString('xl/worksheets/sheet1.xml', $sheet); $zip->close();
+    $data = (string)file_get_contents($tmp); @unlink($tmp); return $data;
+}
+function build_pdf(string $title, string $subtitle, array $cols, array $rows): string {
+    $pe = fn($s) => str_replace(['\\', '(', ')', "\r", "\n"], ['\\\\', '\\(', '\\)', '', ' '], (string)$s);
+    $lines = [[16, $title]];
+    if ($subtitle !== '') $lines[] = [10, $subtitle];
+    $lines[] = [10, implode('  |  ', array_map(fn($c) => $c['label'], $cols))];
+    foreach ($rows as $r) $lines[] = [9, implode('  |  ', array_map(fn($v) => (string)$v, $r))];
+    $content = "BT 40 800 Td 14 TL\n"; $first = true;
+    foreach ($lines as [$sz, $txt]) { $content .= ($first ? "/F1 $sz Tf (" : "/F1 $sz Tf T* (") . $pe($txt) . ") Tj\n"; $first = false; }
+    $content .= "ET";
+    $objs = [1 => "<</Type/Catalog/Pages 2 0 R>>", 2 => "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        3 => "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>",
+        4 => "<</Length " . strlen($content) . ">>\nstream\n" . $content . "\nendstream",
+        5 => "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>"];
+    $pdf = "%PDF-1.4\n"; $off = [];
+    for ($i = 1; $i <= 5; $i++) { $off[$i] = strlen($pdf); $pdf .= "$i 0 obj" . $objs[$i] . "endobj\n"; }
+    $xref = strlen($pdf); $pdf .= "xref\n0 6\n0000000000 65535 f \n";
+    for ($i = 1; $i <= 5; $i++) $pdf .= sprintf("%010d 00000 n \n", $off[$i]);
+    $pdf .= "trailer<</Size 6/Root 1 0 R>>\nstartxref\n$xref\n%%EOF";
+    return $pdf;
+}
+function build_export(array $d): array {
+    $fmt = strtolower((string)($d['format'] ?? 'xlsx'));
+    $title = trim((string)($d['title'] ?? 'Export')); $subtitle = trim((string)($d['subtitle'] ?? ''));
+    [$cols, $rows] = exp_norm($d);
+    $base = preg_replace('/[^A-Za-z0-9 _-]/', '', (string)($d['filename'] ?? ($title ?: 'export'))); $base = str_replace(' ', '_', trim((string)$base)) ?: 'export';
+    if ($fmt === 'csv') {
+        $esc = fn($x) => '"' . str_replace('"', '""', (string)$x) . '"';
+        $csv = implode(',', array_map(fn($c) => $esc($c['label']), $cols)) . "\r\n";
+        foreach ($rows as $r) $csv .= implode(',', array_map(fn($v) => $esc($v), $r)) . "\r\n";
+        return ['filename' => $base . '.csv', 'mime' => 'text/csv', 'b64' => base64_encode("\xEF\xBB\xBF" . $csv)];
+    }
+    if (in_array($fmt, ['xlsx', 'excel', 'xls'], true)) return ['filename' => $base . '.xlsx', 'mime' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'b64' => base64_encode(build_xlsx($title, $cols, $rows))];
+    if ($fmt === 'pdf') return ['filename' => $base . '.pdf', 'mime' => 'application/pdf', 'b64' => base64_encode(build_pdf($title, $subtitle, $cols, $rows))];
+    return ['error' => 'Unsupported format: ' . $fmt];
+}
+function api_export_file(): void {
+    require_auth(); $d = body();
+    try { $r = build_export($d); } catch (Throwable $e) { err('Export failed: ' . $e->getMessage()); }
+    if (!empty($r['error'])) err($r['error']);
+    ok($r);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3e — Financial statements derived from the general ledger: Income &
 // Expenditure, Statement of Financial Position, and Cash Flow. Mirrors the Python
@@ -2657,28 +2736,46 @@ function api_opening_balances_post(): void {
 }
 function api_year_end_close(): void {
     $u = require_role(['Admin']); $d = body();
-    if (empty($d['confirm'])) err('confirm:true is required to close the year');
-    $accs = db()->query("SELECT gl.coa_id, ROUND(SUM(gl.debit_amount-gl.credit_amount),2) net
-        FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id
-        WHERE c.account_type IN ('Income','Expense') GROUP BY gl.coa_id HAVING net<>0")->fetchAll();
-    if (!$accs) err('Nothing to close — no income/expenditure postings');
-    $lines = []; $surplus = 0.0;
-    foreach ($accs as $a) {
-        $net = (float)$a['net'];
-        if ($net > 0) $lines[] = ['coa_id' => $a['coa_id'], 'debit_amount' => 0, 'credit_amount' => $net, 'description' => 'Year-end close']; // expense → credit to clear
-        else $lines[] = ['coa_id' => $a['coa_id'], 'debit_amount' => -$net, 'credit_amount' => 0, 'description' => 'Year-end close']; // income → debit to clear
-        $surplus += -$net;
+    $fy = trim((string)($d['financial_year'] ?? '')); if ($fy === '') err('financial_year is required');
+    $notes = trim((string)($d['notes'] ?? '')); if ($notes === '') err('notes is required');
+    db()->exec("CREATE TABLE IF NOT EXISTS year_end_closes(id TEXT PRIMARY KEY, financial_year TEXT, surplus_deficit REAL, retained_earnings_before REAL, retained_earnings_after REAL, status TEXT DEFAULT 'Closed', prepared_by TEXT, approved_by TEXT, closed_at TEXT, notes TEXT)");
+    $dup = db()->prepare("SELECT 1 FROM year_end_closes WHERE financial_year=?"); $dup->execute([$fy]);
+    if ($dup->fetchColumn()) err('Year-end close already exists for ' . $fy);
+    $d1 = "$fy-01-01"; $d2 = "$fy-12-31";
+    // Surplus/deficit from the GL for the FY (ties to the I&E statement).
+    $inc = (float)(db()->query("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl JOIN chart_of_accounts c ON c.id=gl.coa_id WHERE gl.ledger_date BETWEEN '$d1' AND '$d2' AND (c.category='Revenue' OR c.account_type IN ('Income','Revenue') OR c.code LIKE '4%')")->fetchColumn() ?: 0);
+    $exp = (float)(db()->query("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl JOIN chart_of_accounts c ON c.id=gl.coa_id WHERE gl.ledger_date BETWEEN '$d1' AND '$d2' AND (c.category='Expenses' OR c.account_type='Expense' OR c.code LIKE '5%' OR c.code LIKE '6%')")->fetchColumn() ?: 0);
+    $surplus = round($inc - $exp, 2);
+    $prior = (string)((int)$fy - 1);
+    $pst = db()->prepare("SELECT retained_earnings_after FROM year_end_closes WHERE financial_year=?"); $pst->execute([$prior]);
+    $re_before = round((float)($pst->fetchColumn() ?: 0), 2); $re_after = round($re_before + $surplus, 2);
+    // Closing journal: clear cumulative I/E balances up to the FY end into the
+    // Accumulated Fund. An unused FY (no postings on/before its year-end) closes
+    // cleanly with no journal.
+    $af = db()->query("SELECT id FROM chart_of_accounts WHERE code='31100001'")->fetchColumn()
+        ?: (db()->query("SELECT id FROM chart_of_accounts WHERE account_type='Equity' AND (LOWER(account_name) LIKE '%accumulat%' OR LOWER(account_name) LIKE '%fund%' OR LOWER(account_name) LIKE '%reserve%') ORDER BY code LIMIT 1")->fetchColumn()
+        ?: db()->query("SELECT id FROM chart_of_accounts WHERE account_type='Equity' ORDER BY code LIMIT 1")->fetchColumn());
+    $lines = []; $jvnum = null;
+    if ($af) {
+        $rows = db()->query("SELECT gl.coa_id AS cid, COALESCE(NULLIF(gl.coa_code,''),c.code,'') AS code, COALESCE(c.category,'') AS cat, COALESCE(c.account_type,'') AS typ, SUM(COALESCE(gl.debit_amount,0)) AS dr, SUM(COALESCE(gl.credit_amount,0)) AS cr FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id WHERE gl.ledger_date <= '$d2' GROUP BY gl.coa_id")->fetchAll();
+        foreach ($rows as $r) {
+            $c0 = substr((string)$r['code'], 0, 1); $dr = (float)$r['dr']; $cr = (float)$r['cr'];
+            if ($r['cat'] === 'Revenue' || in_array($r['typ'], ['Income', 'Revenue'], true) || $c0 === '4') {
+                $bal = round($cr - $dr, 2); if (abs($bal) > 0.005) $lines[] = ['coa_id' => $r['cid'], 'debit_amount' => $bal > 0 ? $bal : 0, 'credit_amount' => $bal < 0 ? -$bal : 0, 'description' => "Year-end close of income $fy"];
+            } elseif ($r['cat'] === 'Expenses' || $r['typ'] === 'Expense' || in_array($c0, ['5', '6'], true)) {
+                $bal = round($dr - $cr, 2); if (abs($bal) > 0.005) $lines[] = ['coa_id' => $r['cid'], 'credit_amount' => $bal > 0 ? $bal : 0, 'debit_amount' => $bal < 0 ? -$bal : 0, 'description' => "Year-end close of expenditure $fy"];
+            }
+        }
+        if ($lines) {
+            if ($surplus >= 0) $lines[] = ['coa_id' => $af, 'credit_amount' => $surplus, 'debit_amount' => 0, 'description' => "Surplus for $fy transferred to Accumulated Fund"];
+            else $lines[] = ['coa_id' => $af, 'debit_amount' => -$surplus, 'credit_amount' => 0, 'description' => "Deficit for $fy transferred to Accumulated Fund"];
+            try { [$jid, $jvnum] = post_journal($u, 'AJV', $d2, "$fy-12", "Year-end close $fy — Income & Expenditure to Accumulated Fund", $lines, 'year_end_close', $fy, null); }
+            catch (Throwable $e) { err('Year-end close failed: ' . $e->getMessage()); }
+        }
     }
-    $surplus = round($surplus, 2);
-    $af = db()->query("SELECT id FROM chart_of_accounts WHERE account_type='Equity' AND (LOWER(account_name) LIKE '%accumulat%' OR LOWER(account_name) LIKE '%fund%' OR LOWER(account_name) LIKE '%reserve%') ORDER BY code LIMIT 1")->fetch()
-        ?: db()->query("SELECT id FROM chart_of_accounts WHERE account_type='Equity' ORDER BY code LIMIT 1")->fetch();
-    if (!$af) err('No accumulated-fund / equity account found to receive the surplus');
-    if ($surplus >= 0) $lines[] = ['coa_id' => $af['id'], 'debit_amount' => 0, 'credit_amount' => $surplus, 'description' => 'Surplus to accumulated fund'];
-    else $lines[] = ['coa_id' => $af['id'], 'debit_amount' => -$surplus, 'credit_amount' => 0, 'description' => 'Deficit to accumulated fund'];
-    $fy = (string)($d['financial_year'] ?? date('Y'));
-    try { [$jid, $jvnum] = post_journal($u, 'AJV', "$fy-12-31", "$fy-12", "Year-end close $fy", $lines, 'year_end', $fy, resolve_write_unit($u, $d)); }
-    catch (Throwable $e) { err('Year-end close failed: ' . $e->getMessage()); }
-    ok(['jv_number' => $jvnum, 'surplus_deficit' => $surplus, 'message' => "Financial year $fy closed"]);
+    db()->prepare("INSERT INTO year_end_closes(id,financial_year,surplus_deficit,retained_earnings_before,retained_earnings_after,status,prepared_by,approved_by,closed_at,notes) VALUES(?,?,?,?,?,'Closed',?,?,datetime('now'),?)")
+        ->execute([uuid4(), $fy, $surplus, $re_before, $re_after, $u['username'], $u['username'], $notes]);
+    ok(['close_id' => $fy, 'financial_year' => $fy, 'surplus_deficit' => $surplus, 'retained_earnings_after' => $re_after, 'closing_jv' => $jvnum, 'jv_number' => $jvnum, 'message' => "Financial year $fy closed"]);
 }
 function ensure_wh_table(): void {
     db()->exec("CREATE TABLE IF NOT EXISTS withholding_payables(id TEXT PRIMARY KEY, actual_id TEXT, source_pv_number TEXT,
@@ -3231,6 +3328,7 @@ try {
     if ($path === '/api/ledger/reset-zero' && $method === 'POST') api_ledger_reset_zero();
     if ($path === '/api/year-end-status' && $method === 'GET') api_year_end_status();
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
+    if ($path === '/api/export-file' && $method === 'POST') api_export_file();
     if ($path === '/api/statutory-filings' && $method === 'GET') api_statutory_filings();
     if ($path === '/api/opening-balances/post' && $method === 'POST') api_opening_balances_post();
     if ($path === '/api/withholding-payables' && $method === 'GET') api_withholding_list();
