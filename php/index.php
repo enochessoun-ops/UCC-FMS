@@ -1158,9 +1158,21 @@ function api_ar_customers_list(): void {
 function api_ar_customer_save(): void {
     ensure_arap_tables(); ensure_col('ar_customers', 'unit_id'); $u = require_role(['Admin', 'Finance Officer']); $d = body();
     if (empty($d['customer_name'])) err('customer_name is required');
-    $id = uuid4(); $code = $d['customer_code'] ?? seq_code('ar_customers', 'customer_code', 'CUST-', 4);
+    foreach (['email', 'phone', 'tin', 'customer_type'] as $c) ensure_col('ar_customers', $c);
+    // Upsert: when an id is supplied and exists, update in place (lets the UI add an
+    // email/phone to a debtor); otherwise create a new customer.
+    if (!empty($d['id'])) {
+        $ex = db()->prepare('SELECT id FROM ar_customers WHERE id=?'); $ex->execute([$d['id']]);
+        if ($ex->fetchColumn()) {
+            db()->prepare('UPDATE ar_customers SET customer_name=?, email=?, phone=?, tin=?, customer_type=COALESCE(?,customer_type) WHERE id=?')
+                ->execute([$d['customer_name'], $d['email'] ?? '', $d['phone'] ?? '', $d['tin'] ?? null, $d['customer_type'] ?? null, $d['id']]);
+            ok(['id' => $d['id'], 'updated' => true]);
+        }
+    }
+    $id = $d['id'] ?? uuid4(); $code = $d['customer_code'] ?? seq_code('ar_customers', 'customer_code', 'CUST-', 4);
     $unit = resolve_write_unit($u, $d);
-    db()->prepare('INSERT INTO ar_customers(id,customer_code,customer_name,created_by,unit_id) VALUES(?,?,?,?,?)')->execute([$id, $code, $d['customer_name'], $u['username'], $unit]);
+    db()->prepare('INSERT INTO ar_customers(id,customer_code,customer_name,customer_type,email,phone,tin,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?)')
+        ->execute([$id, $code, $d['customer_name'], $d['customer_type'] ?? 'Customer', $d['email'] ?? '', $d['phone'] ?? '', $d['tin'] ?? null, $u['username'], $unit]);
     ok(['id' => $id, 'customer_code' => $code]);
 }
 function api_ar_invoices_list(): void {
@@ -1616,6 +1628,195 @@ function api_ar_recurring_generate(): void {
         else db()->prepare('UPDATE ar_recurring SET last_generated=?, invoices_generated=invoices_generated+? WHERE id=?')->execute([$asof, $guard, $t['id']]);
     }
     ok(['generated' => $generated, 'count' => count($generated)]);
+}
+
+// ── Email outbox + CSV bulk import + dunning ────────────────────────────────
+function ensure_email_outbox(): void {
+    db()->exec("CREATE TABLE IF NOT EXISTS email_outbox(id TEXT PRIMARY KEY, to_email TEXT, subject TEXT, body TEXT, status TEXT DEFAULT 'Queued', error TEXT, created_at TEXT DEFAULT(datetime('now')), sent_at TEXT)");
+}
+function queue_email(string $to, string $subject, string $bodytext): string {
+    ensure_email_outbox(); $eid = uuid4();
+    db()->prepare("INSERT INTO email_outbox(id,to_email,subject,body,status) VALUES(?,?,?,?,'Queued')")->execute([$eid, $to, $subject, $bodytext]);
+    return $eid;
+}
+function smtp_configured(): bool { return trim((string)getenv('SMTP_HOST')) !== ''; }
+
+// Parse a delimited file (csv_text, or base64 file_b64) into lc-keyed rows. Header
+// keys are lowercased with spaces/dashes -> underscores (mirror _cf_lc_row).
+function import_csv_rows(array $d): array {
+    $txt = (string)($d['csv_text'] ?? '');
+    if ($txt === '' && !empty($d['file_b64'])) $txt = (string)base64_decode(preg_replace('#^data:[^,]*,#', '', (string)$d['file_b64']));
+    $txt = str_replace(["\r\n", "\r"], "\n", $txt);
+    $lines = array_values(array_filter(explode("\n", $txt), fn($l) => trim($l) !== ''));
+    if (count($lines) < 2) return [];
+    $delim = (strpos($lines[0], "\t") !== false) ? "\t" : ',';
+    $hdr = array_map(fn($h) => strtolower(str_replace(["\xEF\xBB\xBF", ' ', '-'], ['', '_', '_'], trim($h))), str_getcsv($lines[0], $delim, '"', ''));
+    $rows = [];
+    for ($i = 1; $i < count($lines); $i++) {
+        $cells = str_getcsv($lines[$i], $delim, '"', ''); $row = [];
+        foreach ($hdr as $j => $k) $row[$k] = isset($cells[$j]) ? trim((string)$cells[$j]) : '';
+        $rows[] = $row;
+    }
+    return $rows;
+}
+function imp_num($v): float { $s = preg_replace('/[, ]|GHS|GH₵|₵/u', '', (string)$v); return is_numeric($s) ? round((float)$s, 2) : 0.0; }
+function imp_date($v): ?string {
+    $s = trim((string)$v); if ($s === '') return null;
+    if (preg_match('/^\d{4}-\d{2}-\d{2}/', $s)) return substr($s, 0, 10);
+    if (preg_match('#^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$#', $s, $m)) { $y = strlen($m[3]) === 2 ? '20' . $m[3] : $m[3]; return sprintf('%04d-%02d-%02d', (int)$y, (int)$m[2], (int)$m[1]); }
+    return null;
+}
+function imp_coa(?string $code, ?string $name): ?string {
+    if ($code) { $r = db()->prepare("SELECT id FROM chart_of_accounts WHERE code=?"); $r->execute([trim($code)]); $x = $r->fetchColumn(); if ($x) return (string)$x; }
+    if ($name) {
+        $nm = strtolower(trim($name));
+        $r = db()->prepare("SELECT id FROM chart_of_accounts WHERE LOWER(account_name)=?"); $r->execute([$nm]); $x = $r->fetchColumn(); if ($x) return (string)$x;
+        $r = db()->prepare("SELECT id FROM chart_of_accounts WHERE LOWER(account_name) LIKE ?"); $r->execute(['%' . $nm . '%']); $x = $r->fetchColumn(); if ($x) return (string)$x;
+    }
+    return null;
+}
+function pick(array $r, array $keys) { foreach ($keys as $k) if (isset($r[$k]) && trim((string)$r[$k]) !== '') return $r[$k]; return null; }
+
+function api_ar_import_invoices(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $rows = import_csv_rows($d); if (!$rows) err('No rows found in the uploaded file');
+    $dft = db()->query("SELECT id FROM chart_of_accounts WHERE code LIKE '4%' ORDER BY code LIMIT 1")->fetchColumn() ?: null;
+    $created = 0; $errors = []; $newids = [];
+    foreach ($rows as $i => $r) {
+        $cname = trim((string)(pick($r, ['customer', 'customer_name', 'debtor', 'client', 'name']) ?? ''));
+        if ($cname === '') { $errors[] = 'Row ' . ($i + 1) . ': missing customer name'; continue; }
+        $amt = imp_num(pick($r, ['amount', 'amount_ghs', 'total', 'total_ghs', 'value']));
+        if ($amt <= 0) { $errors[] = 'Row ' . ($i + 1) . " ($cname): missing/invalid amount"; continue; }
+        $inc = imp_coa(pick($r, ['income_code', 'account_code', 'income_account_code', 'coa_code']), pick($r, ['income_account', 'account', 'account_name'])) ?: $dft;
+        if (!$inc) { $errors[] = 'Row ' . ($i + 1) . ': no income account resolved'; continue; }
+        $cq = db()->prepare("SELECT id FROM ar_customers WHERE LOWER(customer_name)=?"); $cq->execute([strtolower($cname)]); $cid = $cq->fetchColumn();
+        if (!$cid) { $cid = uuid4(); db()->prepare("INSERT INTO ar_customers(id,customer_code,customer_name,created_by) VALUES(?,?,?,?)")->execute([$cid, seq_code('ar_customers', 'customer_code', 'CUST-', 4), $cname, $u['username']]); }
+        $iid = uuid4(); $num = trim((string)(pick($r, ['invoice_no', 'invoice_number']) ?? '')) ?: seq_code('ar_invoices', 'invoice_number', 'INV-', 4);
+        $idate = imp_date(pick($r, ['invoice_date', 'date'])) ?: date('Y-m-d'); $ddate = imp_date(pick($r, ['due_date', 'due'])) ?: $idate;
+        $desc = trim((string)(pick($r, ['description', 'narration', 'details']) ?? ''));
+        db()->prepare("INSERT INTO ar_invoices(id,invoice_number,customer_id,invoice_date,due_date,income_coa_id,description,amount_ghs,tax_ghs,total_ghs,amount_received,status,created_by) VALUES(?,?,?,?,?,?,?,?,0,?,0,'Draft',?)")->execute([$iid, $num, $cid, $idate, $ddate, $inc, $desc, $amt, $amt, $u['username']]);
+        db()->prepare("INSERT INTO ar_invoice_lines(id,invoice_id,line_number,description,income_coa_id,amount_ghs) VALUES(?,?,1,?,?,?)")->execute([uuid4(), $iid, $desc ?: $num, $inc, $amt]);
+        $created++; $newids[] = $iid;
+    }
+    $posted = 0;
+    if (!empty($d['post'])) foreach ($newids as $iid) {
+        try { $st = db()->prepare('SELECT * FROM ar_invoices WHERE id=?'); $st->execute([$iid]); $inv = $st->fetch(); $ar = ar_control_coa();
+            $lines = [['coa_id' => $ar['id'], 'debit_amount' => round((float)$inv['total_ghs'], 2), 'credit_amount' => 0, 'description' => 'Invoice ' . $inv['invoice_number'], 'project_id' => null],
+                      ['coa_id' => $inv['income_coa_id'], 'debit_amount' => 0, 'credit_amount' => round((float)$inv['amount_ghs'], 2), 'description' => $inv['description'] ?? '', 'project_id' => null]];
+            [$jid, $jvnum] = post_journal($u, 'JV', (string)$inv['invoice_date'], substr((string)$inv['invoice_date'], 0, 7), 'AR Invoice ' . $inv['invoice_number'], $lines, 'ar_invoices', $iid, null);
+            db()->prepare("UPDATE ar_invoices SET status='Posted', jv_id=?, jv_number=?, posted_at=datetime('now') WHERE id=?")->execute([$jid, $jvnum, $iid]); $posted++;
+        } catch (Throwable $e) { $errors[] = 'Post error: ' . $e->getMessage(); }
+    }
+    ok(['created' => $created, 'posted' => $posted, 'errors' => array_slice($errors, 0, 40), 'error_count' => count($errors),
+        'message' => "Imported $created invoice(s)" . (!empty($d['post']) ? ", $posted posted" : ' as drafts')]);
+}
+
+function api_ap_import_bills(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $rows = import_csv_rows($d); if (!$rows) err('No rows found in the uploaded file');
+    foreach (['bank_name', 'account_name', 'account_number', 'email'] as $c) ensure_col('vendors', $c);
+    $dft = db()->query("SELECT id FROM chart_of_accounts WHERE code='61300001'")->fetchColumn() ?: (db()->query("SELECT id FROM chart_of_accounts WHERE code LIKE '6%' ORDER BY code LIMIT 1")->fetchColumn() ?: null);
+    $created = 0; $errors = []; $newids = [];
+    foreach ($rows as $i => $r) {
+        $vname = trim((string)(pick($r, ['vendor', 'vendor_name', 'creditor', 'supplier', 'payee', 'name']) ?? ''));
+        if ($vname === '') { $errors[] = 'Row ' . ($i + 1) . ': missing vendor name'; continue; }
+        $amt = imp_num(pick($r, ['amount', 'amount_ghs', 'total', 'total_ghs', 'value']));
+        if ($amt <= 0) { $errors[] = 'Row ' . ($i + 1) . " ($vname): missing/invalid amount"; continue; }
+        $exp = imp_coa(pick($r, ['expense_code', 'account_code', 'expense_account_code', 'coa_code']), pick($r, ['expense_account', 'account', 'account_name'])) ?: $dft;
+        if (!$exp) { $errors[] = 'Row ' . ($i + 1) . ': no expense account resolved'; continue; }
+        $vq = db()->prepare("SELECT id FROM vendors WHERE LOWER(vendor_name)=?"); $vq->execute([strtolower($vname)]); $vid = $vq->fetchColumn();
+        if (!$vid) { $vid = uuid4(); db()->prepare("INSERT INTO vendors(id,vendor_code,vendor_name,vendor_type,created_by) VALUES(?,?,?,'Supplier',?)")->execute([$vid, seq_code('vendors', 'vendor_code', 'VEND-', 5), $vname, $u['username']]); }
+        $bid = uuid4(); $num = seq_code('ap_bills', 'bill_number', 'BILL-', 4);
+        $vinv = trim((string)(pick($r, ['bill_no', 'invoice_no', 'vendor_invoice_no', 'invoice_number']) ?? ''));
+        $bdate = imp_date(pick($r, ['bill_date', 'date', 'invoice_date'])) ?: date('Y-m-d'); $ddate = imp_date(pick($r, ['due_date', 'due'])) ?: $bdate;
+        $desc = trim((string)(pick($r, ['description', 'narration', 'details']) ?? ''));
+        db()->prepare("INSERT INTO ap_bills(id,bill_number,vendor_invoice_no,vendor_id,bill_date,due_date,expense_coa_id,description,amount_ghs,tax_ghs,total_ghs,amount_paid,status,created_by) VALUES(?,?,?,?,?,?,?,?,?,0,?,0,'Draft',?)")->execute([$bid, $num, $vinv, $vid, $bdate, $ddate, $exp, $desc, $amt, $amt, $u['username']]);
+        db()->prepare("INSERT INTO ap_bill_lines(id,bill_id,line_number,description,expense_coa_id,amount_ghs) VALUES(?,?,1,?,?,?)")->execute([uuid4(), $bid, $desc ?: $num, $exp, $amt]);
+        $created++; $newids[] = $bid;
+    }
+    $posted = 0;
+    if (!empty($d['post'])) foreach ($newids as $bid) {
+        try { $st = db()->prepare('SELECT * FROM ap_bills WHERE id=?'); $st->execute([$bid]); $bill = $st->fetch(); $ap = ap_control_coa(); $tot = round((float)$bill['total_ghs'], 2);
+            $lines = [['coa_id' => $bill['expense_coa_id'], 'debit_amount' => $tot, 'credit_amount' => 0, 'description' => $bill['description'] ?? '', 'project_id' => null],
+                      ['coa_id' => $ap['id'], 'debit_amount' => 0, 'credit_amount' => $tot, 'description' => 'Bill ' . $bill['bill_number'], 'project_id' => null]];
+            [$jid, $jvnum] = post_journal($u, 'JV', (string)$bill['bill_date'], substr((string)$bill['bill_date'], 0, 7), 'AP Bill ' . $bill['bill_number'], $lines, 'ap_bills', $bid, null);
+            db()->prepare("UPDATE ap_bills SET status='Posted', jv_id=?, jv_number=?, posted_at=datetime('now') WHERE id=?")->execute([$jid, $jvnum, $bid]); $posted++;
+        } catch (Throwable $e) { $errors[] = 'Post error: ' . $e->getMessage(); }
+    }
+    ok(['created' => $created, 'posted' => $posted, 'errors' => array_slice($errors, 0, 40), 'error_count' => count($errors),
+        'message' => "Imported $created bill(s)" . (!empty($d['post']) ? ", $posted posted" : ' as drafts')]);
+}
+
+// Build + queue an AR/AP account statement email. SMTP-off => queued with a clear
+// message (nothing leaves the server). Returns the result array (no send()).
+function build_and_queue_statement(string $typ, string $rid, ?string $overrideEmail = null): array {
+    if ($rid === '') return ['ok' => false, 'error' => 'Missing customer/vendor id'];
+    if ($typ === 'ap') {
+        $r = db()->prepare("SELECT vendor_name AS name, COALESCE(email,'') AS email FROM vendors WHERE id=?"); $r->execute([$rid]); $who = $r->fetch(); $label = 'Payables';
+        $bq = db()->prepare("SELECT COALESCE(SUM(total_ghs-COALESCE(amount_paid,0)),0) FROM ap_bills WHERE vendor_id=? AND status IN ('Posted','Part-Paid')"); $bq->execute([$rid]);
+    } else {
+        $r = db()->prepare("SELECT customer_name AS name, COALESCE(email,'') AS email FROM ar_customers WHERE id=?"); $r->execute([$rid]); $who = $r->fetch(); $label = 'Receivables';
+        $bq = db()->prepare("SELECT COALESCE(SUM(total_ghs-COALESCE(amount_received,0)),0) FROM ar_invoices WHERE customer_id=? AND status IN ('Posted','Part-Paid')"); $bq->execute([$rid]);
+    }
+    if (!$who) return ['ok' => false, 'error' => 'Account not found'];
+    $name = (string)($who['name'] ?? ''); $email = trim((string)($overrideEmail ?? ($who['email'] ?? '')));
+    if ($email === '' || strpos($email, '@') === false) return ['ok' => false, 'error' => 'No valid email on file for ' . ($name ?: 'this account') . '. Add an email to the account, or provide one.'];
+    $bal = round((float)$bq->fetchColumn(), 2);
+    $subject = sprintf('UCC Finance — Account Statement (balance GHS %.2f)', $bal);
+    $bodytext = sprintf("Dear %s,\n\nPlease find your %s account statement as at %s.\nOutstanding balance: GHS %.2f.\n\nKind regards,\nUCC Finance Office", $name ?: 'Sir/Madam', strtolower($label), date('Y-m-d'), $bal);
+    $eid = queue_email($email, $subject, $bodytext);
+    if (!smtp_configured()) {
+        db()->prepare("UPDATE email_outbox SET status='Queued - SMTP not configured', error=? WHERE id=?")->execute(['Set SMTP_HOST/PORT/USER/PASSWORD/FROM to enable sending.', $eid]);
+        return ['ok' => true, 'queued' => true, 'sent' => false, 'to' => $email, 'message' => 'Statement for ' . ($name ?: 'account') . ' queued to ' . $email . '. Configure SMTP to send automatically.'];
+    }
+    // SMTP configured: best-effort send via PHP mail(); on failure stay queued (graceful).
+    $sent = @mail($email, $subject, $bodytext);
+    db()->prepare("UPDATE email_outbox SET status=?, sent_at=CASE WHEN ?='Sent' THEN datetime('now') ELSE NULL END WHERE id=?")->execute([$sent ? 'Sent' : 'Queued', $sent ? 'Sent' : 'Queued', $eid]);
+    return ['ok' => true, 'queued' => !$sent, 'sent' => (bool)$sent, 'to' => $email, 'message' => $sent ? ('Statement emailed to ' . $email) : ('Statement queued to ' . $email)];
+}
+function api_email_statement(): void {
+    ensure_arap_tables(); require_auth(); $d = body();
+    $res = build_and_queue_statement(strtolower((string)($d['type'] ?? 'ar')), (string)($d['id'] ?? ($d['customer_id'] ?? ($d['vendor_id'] ?? ''))), isset($d['to']) ? (string)$d['to'] : null);
+    if (!$res['ok']) err($res['error']);
+    unset($res['ok']); ok($res);
+}
+
+function dunning_rows(): array {
+    ensure_col('ar_invoices', 'credited_ghs', 'REAL');
+    $rows = db()->query("SELECT c.id AS customer_id, c.customer_name, COALESCE(c.email,'') AS email,
+        SUM(i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0)) AS overdue,
+        COUNT(*) AS invoices, MIN(i.due_date) AS oldest_due
+        FROM ar_invoices i JOIN ar_customers c ON c.id=i.customer_id
+        WHERE i.status IN ('Posted','Part-Paid') AND (i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0)) > 0.01
+          AND i.due_date IS NOT NULL AND date(i.due_date) < date('now')
+        GROUP BY c.id ORDER BY overdue DESC")->fetchAll();
+    foreach ($rows as &$r) {
+        $r['overdue'] = round((float)$r['overdue'], 2);
+        $r['has_email'] = trim((string)$r['email']) !== '';
+        $od = strtotime(substr((string)$r['oldest_due'], 0, 10)); $r['days_overdue'] = $od ? max(0, (int)floor((time() - $od) / 86400)) : 0;
+    }
+    unset($r);
+    return $rows;
+}
+function api_dunning_preview(): void {
+    ensure_arap_tables(); require_auth();
+    $rows = dunning_rows();
+    ok(['customers' => $rows, 'total_overdue' => round(array_sum(array_map(fn($r) => $r['overdue'], $rows)), 2), 'count' => count($rows)]);
+}
+function api_dunning_run(): void {
+    ensure_arap_tables(); require_role(['Admin', 'Finance Officer']); $d = body();
+    $ids = $d['customer_ids'] ?? null;
+    $targets = dunning_rows();
+    if ($ids) { $set = array_flip((array)$ids); $targets = array_values(array_filter($targets, fn($c) => isset($set[$c['customer_id']]))); }
+    $targets = array_values(array_filter($targets, fn($c) => $c['has_email']));
+    if (!$targets) err('No overdue customers with an email address to remind');
+    $sent = 0; $queued = 0; $results = [];
+    foreach ($targets as $c) {
+        $res = build_and_queue_statement('ar', $c['customer_id']);
+        if (!empty($res['ok'])) { if (!empty($res['sent'])) $sent++; else $queued++; $results[] = ['customer' => $c['customer_name'], 'to' => $res['to'] ?? null, 'status' => !empty($res['sent']) ? 'sent' : 'queued']; }
+        else $results[] = ['customer' => $c['customer_name'], 'status' => 'error', 'error' => $res['error'] ?? ''];
+    }
+    ok(['sent' => $sent, 'queued' => $queued, 'results' => $results, 'message' => "Dunning: $sent sent, $queued queued (configure SMTP to send)"]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2798,6 +2999,11 @@ try {
     if ($path === '/api/ar/recurring' && $method === 'POST') api_ar_save_recurring();
     if ($path === '/api/ar/recurring/toggle' && $method === 'POST') api_ar_recurring_toggle();
     if ($path === '/api/ar/recurring/generate' && $method === 'POST') api_ar_recurring_generate();
+    if ($path === '/api/ar/import-invoices' && $method === 'POST') api_ar_import_invoices();
+    if ($path === '/api/ap/import-bills' && $method === 'POST') api_ap_import_bills();
+    if ($path === '/api/email-statement' && $method === 'POST') api_email_statement();
+    if ($path === '/api/dunning-preview' && $method === 'GET') api_dunning_preview();
+    if ($path === '/api/dunning-run' && $method === 'POST') api_dunning_run();
     if ($path === '/api/ap/payment-run-file' && $method === 'POST') api_payment_run_file();
 
     // Phase 3d (inventory) — stores ledger
