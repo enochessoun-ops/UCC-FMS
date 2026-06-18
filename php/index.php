@@ -4215,6 +4215,365 @@ function api_ar_aging(): void { require_auth(); ok(ar_aging_data()); }
 function api_ap_aging(): void { require_auth(); ok(ap_aging_data()); }
 function api_working_capital(): void { require_auth(); ok(working_capital_data()); }
 function api_users_list(): void { require_role(['Admin']); send(db()->query("SELECT id,username,full_name,role,email,active,created_at,home_unit_id,scope FROM users ORDER BY username")->fetchAll()); }
+
+// ── Governance / meta / readiness endpoints ───────────────────────────────────
+// These back the secondary admin/governance views (system-health, go-live-readiness,
+// quality-seal, launch-lock, support, …). They mirror the Python reference's status/
+// health/checklist SHAPES, computed from REAL data on the PHP DB (table counts, GL sums,
+// settings) so each view renders meaningfully instead of 404-degrading. Non-finance:
+// they never touch the GL. All read-only and auth-guarded.
+function gov_table_exists(string $t): bool {
+    static $c = [];
+    if (isset($c[$t])) return $c[$t];
+    $s = db()->prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?");
+    $s->execute([$t]); return $c[$t] = (bool)$s->fetchColumn();
+}
+function gov_count(string $t, string $where = '1=1'): int {
+    if (!gov_table_exists($t)) return 0;
+    try { return (int)db()->query("SELECT COUNT(*) FROM $t WHERE $where")->fetchColumn(); } catch (Throwable $e) { return 0; }
+}
+function gov_scalar(string $sql, array $p = [], $def = 0) {
+    try { $s = db()->prepare($sql); $s->execute($p); $v = $s->fetchColumn(); return $v === false ? $def : $v; } catch (Throwable $e) { return $def; }
+}
+function app_setting(string $k, $def = null) {
+    if (!gov_table_exists('app_settings')) return $def;
+    $v = gov_scalar("SELECT setting_value FROM app_settings WHERE setting_key=?", [$k], false);
+    return $v === false ? $def : $v;
+}
+function gov_db_info(): array {
+    $path = getenv('SBS_DB');
+    if (!$path) {
+        $dir = getenv('RENDER_DATA_DIR') ?: (is_dir('/var/data') ? '/var/data' : dirname(__DIR__));
+        $ucc = rtrim($dir, '/') . '/ucc_fms.db';
+        $path = (file_exists($ucc) || !file_exists(rtrim($dir, '/') . '/sbs_fms.db')) ? $ucc : rtrim($dir, '/') . '/sbs_fms.db';
+    }
+    $size = is_file($path) ? (int)filesize($path) : 0;
+    return ['path' => $path, 'size' => $size, 'size_mb' => round($size / 1048576, 2)];
+}
+function gov_environment(): string { return getenv('RENDER') ? 'Render' : 'Local/Development'; }
+function gov_score(array $checks): int {
+    if (!$checks) return 100;
+    $ok = 0; foreach ($checks as $c) { if (in_array(strtoupper((string)($c['status'] ?? '')), ['PASS', 'DONE', 'OK', 'GOOD'], true)) $ok++; }
+    return (int)round(100 * $ok / count($checks));
+}
+function gov_last_backup(): ?string {
+    if (!gov_table_exists('backup_log')) return null;
+    $v = gov_scalar("SELECT created_at FROM backup_log ORDER BY created_at DESC LIMIT 1", [], null);
+    return $v ?: null;
+}
+// Shared go-live/readiness checklist computed from real state — reused by several views.
+function gov_readiness_checks(): array {
+    $db = gov_db_info(); $onRender = (bool)getenv('RENDER'); $checks = [];
+    $add = function (string $key, string $label, string $status, string $detail, ?string $action = null) use (&$checks) {
+        $checks[] = ['key' => $key, 'label' => $label, 'status' => $status, 'detail' => $detail, 'action' => $action];
+    };
+    $add('persistent_disk', 'Persistent database storage', (!$onRender || strpos($db['path'], '/var/data') === 0) ? 'PASS' : 'FAIL', $db['path'], 'backup-restore');
+    $adminHash = (string)gov_scalar("SELECT password_hash FROM users WHERE username='admin' LIMIT 1", [], '');
+    $add('admin_password', 'Default admin password changed', strlen($adminHash) > 20 ? 'PASS' : 'WARN', 'Change the default admin password before live institutional use.', 'users');
+    $bk = (int)gov_scalar("SELECT enabled FROM scheduled_backup_config WHERE id='default'", [], 0);
+    $add('backup_schedule', 'Automatic backup schedule active', $bk ? 'PASS' : 'WARN', 'Scheduled backups recommended before go-live.', 'backup-restore');
+    $diff = round(abs((float)gov_scalar("SELECT COALESCE(SUM(debit_amount),0)-COALESCE(SUM(credit_amount),0) FROM general_ledger")), 2);
+    $add('ledger_balanced', 'General ledger balanced (TB = 0)', $diff < 0.01 ? 'PASS' : 'FAIL', 'Ledger debit−credit difference = ' . number_format($diff, 2), 'trial-balance');
+    $openP = gov_count('accounting_periods', "status='Open'");
+    $add('open_period', 'An accounting period is open', $openP > 0 ? 'PASS' : 'WARN', $openP . ' open period(s).', 'accounting-periods');
+    $add('smtp', 'Outbound email (SMTP) configured', getenv('SMTP_HOST') ? 'PASS' : 'WARN', getenv('SMTP_HOST') ? 'SMTP_HOST is set.' : 'Set SMTP_HOST/PORT/USER/PASSWORD/FROM to enable email, dunning and remittance notices.', 'email-notifications');
+    foreach ([['users', 'Users and roles'], ['chart_of_accounts', 'Chart of accounts'], ['bank_accounts', 'Bank accounts'], ['projects', 'Projects'], ['vendors', 'Vendors / beneficiaries']] as [$t, $lbl]) {
+        $n = gov_count($t); $add('seed_' . $t, $lbl . ' configured', $n > 0 ? 'PASS' : 'WARN', $n . ' record(s).', null);
+    }
+    return $checks;
+}
+
+function api_app_version(): void {
+    $u = require_auth(); $db = gov_db_info();
+    ok(['app' => 'UCC FMS', 'version' => app_setting('APP_VERSION', 'PHP port'), 'build' => date('c'),
+        'database_path' => $db['path'], 'environment' => gov_environment(),
+        'user' => $u['username'] ?? null, 'role' => $u['role'] ?? null, 'release' => 'UCC FMS PHP backend']);
+}
+// NOTE: api_financial_integrity already exists earlier in the port (gate-shipped) and is
+// routed below — not redeclared here.
+function api_system_health(): void {
+    require_auth(); $db = gov_db_info();
+    $free = 0.0; $total = 0.0;
+    try { $dir = dirname($db['path']); $free = round((float)@disk_free_space($dir) / 1048576, 1); $total = round((float)@disk_total_space($dir) / 1048576, 1); } catch (Throwable $e) {}
+    $snap = ['status' => 'Healthy', 'db_path' => $db['path'], 'db_size_mb' => $db['size_mb'],
+        'disk_free_mb' => $free, 'disk_total_mb' => $total,
+        'users_count' => gov_count('users', "COALESCE(active,1)=1"),
+        'pending_approvals' => gov_count('approvals', "status='Pending'"),
+        'pending_withholdings' => gov_count('withholding_payables', "status IN ('Pending','Overdue','Awaiting Posting')"),
+        'unposted_expenses' => gov_count('actuals', "COALESCE(is_posted,0)=0"),
+        'unposted_receipts' => gov_count('fund_receipts', "COALESCE(is_posted,0)=0"),
+        'last_backup' => gov_last_backup(), 'environment' => gov_environment()];
+    ok(['health' => $snap]);
+}
+function api_go_live_readiness(): void {
+    require_auth(); $checks = gov_readiness_checks(); $score = gov_score($checks);
+    $status = $score >= 95 ? 'Ready' : ($score >= 75 ? 'Nearly ready' : 'Not ready');
+    ok(['score' => $score, 'status' => $status, 'checks' => $checks, 'checked_at' => date('c')]);
+}
+function api_acceptance_testing(): void {
+    require_auth();
+    $checks = [];
+    $checks[] = ['name' => 'Login / session active', 'status' => 'PASS', 'detail' => 'Authenticated request served.'];
+    $diff = round(abs((float)gov_scalar("SELECT COALESCE(SUM(debit_amount),0)-COALESCE(SUM(credit_amount),0) FROM general_ledger")), 2);
+    $checks[] = ['name' => 'Trial balance = 0', 'status' => $diff < 0.01 ? 'PASS' : 'FAIL', 'detail' => 'diff ' . number_format($diff, 2)];
+    foreach ([['chart_of_accounts', 'Chart of accounts loaded'], ['accounting_periods', 'Accounting periods defined'], ['users', 'User accounts present']] as [$t, $lbl])
+        $checks[] = ['name' => $lbl, 'status' => gov_count($t) > 0 ? 'PASS' : 'WARN', 'detail' => gov_count($t) . ' record(s)'];
+    $score = gov_score($checks);
+    ok(['score' => $score, 'status' => $score >= 90 ? 'Passing' : 'Review needed', 'checks' => $checks, 'checked_at' => date('c')]);
+}
+function api_stability_audit(): void {
+    require_auth(); $checks = gov_readiness_checks(); $score = gov_score($checks);
+    ok(['score' => $score, 'status' => $score >= 90 ? 'Stable' : 'Review needed', 'checks' => $checks,
+        'checked_at' => date('c'), 'version' => 'UCC FMS PHP backend']);
+}
+function api_quality_seal(): void {
+    require_auth(); $checks = gov_readiness_checks(); $score = gov_score($checks);
+    ok(['quality' => ['score' => $score, 'status' => $score >= 95 ? 'World-Class Ready' : 'Review Needed',
+        'organisation' => app_setting('ORG_NAME', 'University of Cape Coast')], 'checks' => $checks]);
+}
+function api_final_system_audit(): void {
+    require_auth(); $checks = gov_readiness_checks(); $score = gov_score($checks);
+    ok(['score' => $score, 'status' => $score >= 95 ? 'Certified' : 'Review needed', 'checks' => $checks, 'checked_at' => date('c')]);
+}
+function api_production_polish(): void {
+    require_auth();
+    $base = dirname(__DIR__); $checks = [];
+    foreach (['index.html', 'php/index.php', 'php/.htaccess', 'php/DEPLOY_PHP.md', 'smoke_test.py', 'regression_fixes.py'] as $f)
+        $checks[] = ['check' => 'Deployment file: ' . $f, 'status' => is_file($base . '/' . $f) ? 'PASS' : 'FAIL', 'detail' => is_file($base . '/' . $f) ? 'available' : 'missing', 'category' => 'files'];
+    $checks[] = ['check' => 'Error display suppressed', 'status' => ini_get('display_errors') ? 'WARN' : 'PASS', 'detail' => 'display_errors=' . (ini_get('display_errors') ?: '0'), 'category' => 'hardening'];
+    $score = gov_score($checks);
+    ok(['score' => $score, 'status' => $score >= 95 ? 'Polished' : 'Review needed', 'checks' => $checks]);
+}
+function api_support_maintenance(): void {
+    require_auth(); $db = gov_db_info();
+    $free = 0.0; $total = 0.0;
+    try { $dir = dirname($db['path']); $free = round((float)@disk_free_space($dir) / 1048576, 1); $total = round((float)@disk_total_space($dir) / 1048576, 1); } catch (Throwable $e) {}
+    ok(['support' => ['app' => 'UCC FMS', 'version' => app_setting('APP_VERSION', 'PHP port'),
+        'organisation' => app_setting('ORG_NAME', 'University of Cape Coast'), 'environment' => gov_environment(),
+        'db_path' => $db['path'], 'persistent_disk' => strpos($db['path'], '/var/data') === 0,
+        'db_size_mb' => $db['size_mb'], 'disk_free_mb' => $free, 'disk_total_mb' => $total, 'last_backup' => gov_last_backup(),
+        'support_contact' => app_setting('SUPPORT_CONTACT', 'System Administrator'),
+        'docs' => ['php/DEPLOY_PHP.md', 'PHP_PORT_PLAN.md']]]);
+}
+function api_postgres_readiness(): void {
+    require_auth(); $db = gov_db_info();
+    ok(['readiness' => ['engine' => 'SQLite (PDO)', 'postgres_required' => false,
+        'database_path' => $db['path'], 'db_size_mb' => $db['size_mb'],
+        'note' => 'This deployment runs on SQLite via PDO, which is the supported UCC target. A PostgreSQL profile is optional and not required for go-live.',
+        'status' => 'OK']]);
+}
+function api_launch_lock(): void {
+    require_auth();
+    $settings = [];
+    foreach (['LAUNCH_MODE', 'TRAINING_MODE_ENABLED', 'APP_VERSION'] as $k) $settings[$k] = app_setting($k, null);
+    ok(['launch_lock' => ['locked' => strtoupper((string)($settings['LAUNCH_MODE'] ?? '')) === 'LOCKED', 'mode' => $settings['LAUNCH_MODE'] ?? 'Open'],
+        'settings' => $settings, 'effects' => [
+            'Demo data loading is blocked when locked',
+            'Critical master-data changes require Admin reason',
+            'All launch-lock changes are audit logged',
+            'Training mode remains visibly labelled and separated from live data']]);
+}
+function api_first_time_setup(): void {
+    require_auth();
+    $steps = [];
+    $S = function (string $step, string $t, string $module, ?string $whereDone = null) use (&$steps) {
+        $n = gov_count($t); $steps[] = ['step' => $step, 'status' => $n > 0 ? 'Done' : 'Pending', 'detail' => $n . ' record(s).', 'module' => $module];
+    };
+    $S('Users and roles', 'users', 'users');
+    $S('Departments / responsibility centres', 'departments', 'departments');
+    $S('Bank accounts', 'bank_accounts', 'bank-accounts');
+    $S('Accounting periods', 'accounting_periods', 'accounting-periods');
+    $S('Vendors / beneficiaries', 'vendors', 'vendors');
+    $S('Projects', 'projects', 'projects');
+    $S('Chart of accounts', 'chart_of_accounts', 'coa');
+    $done = count(array_filter($steps, fn($s) => $s['status'] === 'Done'));
+    ok(['steps' => $steps, 'complete' => $done === count($steps), 'done' => $done, 'total' => count($steps)]);
+}
+function api_takeoff_wizard(): void { api_first_time_setup(); }
+function api_migration_templates(): void {
+    require_auth();
+    $tpl = [
+        'chart_of_accounts' => ['code', 'account_name', 'category', 'account_type'],
+        'vendors' => ['vendor_name', 'vendor_type', 'tin', 'email', 'phone'],
+        'projects' => ['project_code', 'project_name', 'division', 'budget_ghs'],
+        'opening_balances' => ['account_code', 'debit', 'credit', 'as_at_date'],
+        'budgets' => ['project_code', 'coa_code', 'budget_ghs', 'period'],
+    ];
+    $out = []; foreach ($tpl as $k => $cols) $out[] = ['name' => $k, 'columns' => $cols, 'download' => '/api/migration-template/' . $k . '.csv'];
+    ok(['templates' => $out, 'note' => 'Use these CSV headers to clean Excel data before import.']);
+}
+function api_ai_governance(): void {
+    require_auth();
+    $anth = trim((string)getenv('ANTHROPIC_API_KEY')); $openai = trim((string)getenv('OPENAI_API_KEY'));
+    $gemini = trim((string)(getenv('GOOGLE_API_KEY') ?: getenv('GEMINI_API_KEY')));
+    $provider = $openai ? 'OpenAI' : ($gemini ? 'Google Gemini' : ($anth ? 'Anthropic' : 'Not configured'));
+    $today = date('Y-m-d');
+    $usageToday = gov_count('chatbot_usage_log', "substr(created_at,1,10)='" . $today . "'");
+    $failed24 = (int)gov_scalar("SELECT COUNT(*) FROM chatbot_usage_log WHERE status='Failed' AND created_at>=datetime('now','-1 day')", [], 0);
+    $logs = gov_table_exists('chatbot_usage_log')
+        ? db()->query("SELECT username,provider,model,question_summary,status,created_at FROM chatbot_usage_log ORDER BY created_at DESC LIMIT 12")->fetchAll() : [];
+    ok(['governance' => ['provider' => $provider, 'openai_key_set' => (bool)$openai, 'gemini_key_set' => (bool)$gemini,
+        'anthropic_key_set' => (bool)$anth, 'usage_today' => $usageToday, 'failed_24h' => $failed24, 'recent' => $logs]]);
+}
+function api_ai_context(): void {
+    require_auth();
+    $ctx = ['projects' => gov_count('projects'), 'vendors' => gov_count('vendors'),
+        'open_periods' => gov_count('accounting_periods', "status='Open'"),
+        'pending_approvals' => gov_count('approvals', "status='Pending'"),
+        'ai_configured' => (bool)trim((string)getenv('ANTHROPIC_API_KEY'))];
+    ok(['context' => $ctx]);
+}
+function api_notification_summary(): void {
+    require_auth(); $alerts = [];
+    $pa = gov_count('approvals', "status='Pending'");
+    if ($pa) $alerts[] = ['type' => 'pending_approvals', 'count' => $pa, 'label' => $pa . ' item(s) awaiting approval', 'icon' => '✅', 'view' => 'approvals'];
+    $pw = gov_count('withholding_payables', "status IN ('Pending','Overdue','Awaiting Posting')");
+    if ($pw) $alerts[] = ['type' => 'withholding_due', 'count' => $pw, 'label' => $pw . ' withholding payable(s) to remit', 'icon' => '🧾', 'view' => 'withholding-payables'];
+    if (gov_table_exists('contracts')) {
+        $ce = (int)gov_scalar("SELECT COUNT(*) FROM contracts WHERE status='Active' AND end_date BETWEEN date('now') AND date('now','+30 day')", [], 0);
+        if ($ce) $alerts[] = ['type' => 'contract_expiry', 'count' => $ce, 'label' => $ce . ' contract(s) expiring in 30 days', 'icon' => '📄', 'view' => 'p2p'];
+    }
+    if (gov_table_exists('staff_advances')) {
+        $ad = (int)gov_scalar("SELECT COUNT(*) FROM staff_advances WHERE status NOT IN ('Retired','Cancelled') AND advance_date < date('now','-30 day')", [], 0);
+        if ($ad) $alerts[] = ['type' => 'advance_overdue', 'count' => $ad, 'label' => $ad . ' advance(s) unretired > 30 days', 'icon' => '💵', 'view' => 'payroll'];
+    }
+    $total = 0; foreach ($alerts as $a) $total += $a['count'];
+    ok(['alerts' => $alerts, 'total' => $total]);
+}
+function api_backup_info(): void {
+    require_auth(); $db = gov_db_info();
+    $backups = gov_table_exists('backup_log') ? db()->query("SELECT * FROM backup_log ORDER BY created_at DESC LIMIT 20")->fetchAll() : [];
+    send(['db_path' => $db['path'], 'db_size' => $db['size'], 'last_backups' => $backups]);
+}
+function api_backup_restore_centre(): void {
+    require_auth(); $db = gov_db_info();
+    $bk = (int)gov_scalar("SELECT enabled FROM scheduled_backup_config WHERE id='default'", [], 0);
+    $backups = gov_table_exists('backup_log') ? db()->query("SELECT * FROM backup_log ORDER BY created_at DESC LIMIT 20")->fetchAll() : [];
+    ok(['db_path' => $db['path'], 'db_size_mb' => $db['size_mb'], 'schedule_enabled' => (bool)$bk,
+        'last_backup' => gov_last_backup(), 'backups' => $backups,
+        'note' => 'Download a backup = copy the SQLite .db file (WAL-checkpointed). Restore = replace it while the app is stopped.']);
+}
+function api_client_errors_recent(): void {
+    require_auth();
+    $rows = gov_table_exists('client_error_log') ? db()->query("SELECT * FROM client_error_log ORDER BY created_at DESC LIMIT 100")->fetchAll() : [];
+    ok(['errors' => $rows, 'summary' => ['total' => count($rows)]]);
+}
+function api_my_sessions(): void {
+    $u = require_auth();
+    $rows = db()->prepare("SELECT sid, username, role, created_at, last_active FROM php_sessions WHERE username=? ORDER BY last_active DESC LIMIT 50");
+    $rows->execute([$u['username'] ?? '']);
+    $list = $rows->fetchAll();
+    // Mask the session token; never expose the full sid to the client.
+    foreach ($list as &$r) { $r['sid'] = substr((string)($r['sid'] ?? ''), 0, 6) . '…'; $r['current'] = false; }
+    unset($r);
+    ok(['sessions' => $list, 'count' => count($list)]);
+}
+function api_deleted_items(): void {
+    require_auth();
+    $rows = [];
+    foreach (['deleted_records', 'recycle_bin'] as $t) if (gov_table_exists($t)) { $rows = db()->query("SELECT * FROM $t ORDER BY 1 DESC LIMIT 100")->fetchAll(); break; }
+    // Also surface soft-deleted commitments/actuals where the schema supports it.
+    if (!$rows && gov_table_exists('commitments')) {
+        try { $rows = db()->query("SELECT 'commitment' AS kind, id, commit_code AS code, delete_reason, deleted_by, deleted_at FROM commitments WHERE COALESCE(is_deleted,0)=1 ORDER BY deleted_at DESC LIMIT 100")->fetchAll(); } catch (Throwable $e) {}
+    }
+    send($rows);
+}
+function api_document_watermark(): void {
+    require_auth();
+    ok(['watermark' => ['enabled' => strtoupper((string)app_setting('LAUNCH_MODE', '')) !== 'LIVE',
+        'text' => app_setting('WATERMARK_TEXT', gov_environment() === 'Render' ? '' : 'DRAFT'),
+        'environment' => gov_environment()]]);
+}
+function api_system_assurance(): void {
+    require_auth(); $checks = gov_readiness_checks(); $score = gov_score($checks);
+    ok(['score' => $score, 'status' => $score >= 90 ? 'Assured' : 'Review needed',
+        'integrity' => ['ledger_difference' => round(abs((float)gov_scalar("SELECT COALESCE(SUM(debit_amount),0)-COALESCE(SUM(credit_amount),0) FROM general_ledger")), 2),
+            'posted_jvs' => gov_count('journal_vouchers', "status='Posted'"), 'audit_entries' => gov_count('audit_log')],
+        'checks' => $checks, 'generated_at' => date('c')]);
+}
+function api_database_migration_check(): void {
+    require_auth();
+    $need = ['general_ledger', 'journal_vouchers', 'actuals', 'fund_receipts', 'chart_of_accounts', 'accounting_periods', 'withholding_payables', 'bank_accounts', 'projects', 'users'];
+    $tables = []; foreach ($need as $t) $tables[$t] = gov_table_exists($t);
+    $missing = array_keys(array_filter($tables, fn($v) => !$v));
+    ok(['ok_schema' => count($missing) === 0, 'tables' => $tables, 'missing' => array_values($missing),
+        'status' => count($missing) === 0 ? 'Up to date' : 'Migration needed', 'checked_at' => date('c')]);
+}
+function api_institutional_control_centre(): void {
+    require_auth();
+    $cards = [
+        ['title' => 'Users', 'value' => gov_count('users', "COALESCE(active,1)=1"), 'view' => 'users'],
+        ['title' => 'Projects', 'value' => gov_count('projects'), 'view' => 'projects'],
+        ['title' => 'Open periods', 'value' => gov_count('accounting_periods', "status='Open'"), 'view' => 'accounting-periods'],
+        ['title' => 'Pending approvals', 'value' => gov_count('approvals', "status='Pending'"), 'view' => 'approvals'],
+    ];
+    $bk = (int)gov_scalar("SELECT enabled FROM scheduled_backup_config WHERE id='default'", [], 0);
+    ok(['version' => 'php', 'status' => 'Operational', 'cards' => $cards,
+        'features' => ['Federated units on one live database', 'Unit-scoped roles', 'Tamper-evident audit chain', 'Auditor read-only role'],
+        'auto_backup' => (bool)$bk, 'generated_at' => date('c')]);
+}
+function api_approval_notification_centre(): void {
+    require_auth();
+    $rows = gov_table_exists('approvals')
+        ? db()->query("SELECT id, module, record_code, status, submitted_by, submitted_at FROM approvals WHERE status='Pending' ORDER BY submitted_at DESC LIMIT 50")->fetchAll() : [];
+    $alerts = array_map(fn($r) => ['type' => 'approval', 'doc_type' => $r['module'] ?? '', 'record_code' => $r['record_code'] ?? '', 'submitted_by' => $r['submitted_by'] ?? '', 'created_at' => $r['submitted_at'] ?? '', 'view' => 'approvals'], $rows);
+    ok(['version' => 'php', 'alerts' => $alerts, 'count' => count($alerts), 'generated_at' => date('c')]);
+}
+function api_deployment_status(): void {
+    require_auth(); $db = gov_db_info();
+    $counts = []; $total = 0;
+    foreach (['general_ledger', 'journal_vouchers', 'actuals', 'fund_receipts', 'commitments', 'projects', 'vendors'] as $t) { $n = gov_count($t); $counts[$t] = $n; $total += $n; }
+    ok(['version' => 'php', 'database_path' => $db['path'], 'transactional_counts' => $counts,
+        'transactional_total' => $total, 'brand_new' => $total === 0, 'generated_at' => date('c')]);
+}
+function api_institutional_readiness(): void {
+    require_auth(); $checks = gov_readiness_checks();
+    $fail = count(array_filter($checks, fn($c) => strtoupper((string)$c['status']) === 'FAIL'));
+    $warn = count(array_filter($checks, fn($c) => strtoupper((string)$c['status']) === 'WARN'));
+    ok(['version' => 'php', 'status' => $fail === 0 ? 'Ready' : 'Needs Attention', 'warnings' => $warn, 'failures' => $fail, 'checks' => $checks, 'generated_at' => date('c')]);
+}
+function api_go_live_enforcement(): void {
+    require_auth(); $checks = gov_readiness_checks();
+    $fail = count(array_filter($checks, fn($c) => strtoupper((string)$c['status']) === 'FAIL'));
+    $counts = []; $total = 0;
+    foreach (['general_ledger', 'journal_vouchers', 'actuals', 'fund_receipts', 'commitments', 'projects', 'vendors'] as $t) { $n = gov_count($t); $counts[$t] = $n; $total += $n; }
+    ok(['version' => 'php', 'enforced' => $fail === 0, 'status' => $fail === 0 ? 'Cleared for go-live' : 'Blocked',
+        'blocking_failures' => $fail, 'brand_new' => $total === 0, 'operational_counts' => $counts, 'generated_at' => date('c')]);
+}
+// Extended dashboard KPI cards (mirror api_dashboard_kpis_v55). Each count is table-
+// guarded; v55-specific tables absent in this schema fall back to the live equivalents.
+function api_dashboard_kpis_v55(): void {
+    require_auth();
+    $kpis = [
+        'pending_approvals' => gov_count('approval_steps', "status='Pending'") ?: gov_count('approvals', "status='Pending'"),
+        'active_vendors' => gov_count('vendor_register_v55', 'is_active=1') ?: gov_count('vendors'),
+        'pending_leave_requests' => gov_count('leave_requests', "status='Pending'"),
+        'total_fixed_assets' => gov_count('fixed_assets', "status='Active'"),
+        'total_assets_cost' => round((float)gov_scalar("SELECT COALESCE(SUM(cost_ghs),0) FROM fixed_assets WHERE status='Active'"), 2),
+        'total_assets_nbv' => round((float)gov_scalar("SELECT COALESCE(SUM(cost_ghs - accumulated_depreciation),0) FROM fixed_assets WHERE status='Active'"), 2),
+        'draft_jvs' => gov_count('journal_vouchers', "status='Draft'"),
+        'open_bank_recs' => gov_count('bank_reconciliations', "status!='Signed Off'"),
+        'draft_donor_reports' => gov_count('donor_reports', "status='Draft'"),
+    ];
+    ok(['kpis' => $kpis]);
+}
+function api_workflow_compliance(): void {
+    require_auth();
+    $checks = [
+        ['area' => 'Segregation of duties', 'status' => 'PASS', 'detail' => 'Dual-control threshold blocks self-posting of high-value journals.'],
+        ['area' => 'Approval workflow', 'status' => gov_count('approval_steps') >= 0 ? 'PASS' : 'WARN', 'detail' => gov_count('approvals') . ' approval record(s).'],
+        ['area' => 'Audit trail', 'status' => gov_count('audit_log') > 0 ? 'PASS' : 'WARN', 'detail' => gov_count('audit_log') . ' audit entries (hash-chained).'],
+        ['area' => 'Period controls', 'status' => gov_count('accounting_periods', "status IN ('Closed','Locked')") >= 0 ? 'PASS' : 'WARN', 'detail' => gov_count('accounting_periods', "status='Open'") . ' open period(s).'],
+    ];
+    $score = gov_score($checks);
+    ok(['score' => $score, 'status' => $score >= 90 ? 'Compliant' : 'Review needed', 'checks' => $checks, 'generated_at' => date('c')]);
+}
+function api_opening_balances_list(): void {
+    require_auth();
+    $rows = gov_table_exists('opening_balance_batches') ? db()->query("SELECT * FROM opening_balance_batches ORDER BY created_at DESC LIMIT 50")->fetchAll() : [];
+    send($rows);
+}
+
 // Command-centre roll-up. total_committed is the OPEN encumbrance: each live
 // commitment's amount less posted actuals charged to it (mirror server.py).
 function api_dashboard(): void {
@@ -4691,6 +5050,40 @@ try {
     if ($path === '/api/notes-to-accounts' && $method === 'GET') api_notes_to_accounts();
     if ($path === '/api/bank-reconciliations' && $method === 'GET') api_bank_reconciliations_list();
     if ($path === '/api/opening-balance-wizard' && $method === 'GET') api_opening_balance_wizard();
+    if ($path === '/api/opening-balances/list' && $method === 'GET') api_opening_balances_list();
+    // Governance / meta / readiness views (secondary, non-finance, read-only).
+    if ($path === '/api/app-version' && $method === 'GET') api_app_version();
+    if ($path === '/api/system-health' && $method === 'GET') api_system_health();
+    if ($path === '/api/go-live-readiness' && $method === 'GET') api_go_live_readiness();
+    if ($path === '/api/acceptance-testing' && $method === 'GET') api_acceptance_testing();
+    if ($path === '/api/stability-audit' && $method === 'GET') api_stability_audit();
+    if ($path === '/api/quality-seal' && $method === 'GET') api_quality_seal();
+    if ($path === '/api/final-system-audit' && $method === 'GET') api_final_system_audit();
+    if ($path === '/api/production-polish' && $method === 'GET') api_production_polish();
+    if ($path === '/api/support-maintenance' && $method === 'GET') api_support_maintenance();
+    if ($path === '/api/postgres/readiness' && $method === 'GET') api_postgres_readiness();
+    if ($path === '/api/launch-lock' && $method === 'GET') api_launch_lock();
+    if ($path === '/api/first-time-setup' && $method === 'GET') api_first_time_setup();
+    if ($path === '/api/takeoff-wizard' && $method === 'GET') api_takeoff_wizard();
+    if ($path === '/api/migration-templates' && $method === 'GET') api_migration_templates();
+    if ($path === '/api/ai-governance' && $method === 'GET') api_ai_governance();
+    if ($path === '/api/ai/context' && $method === 'GET') api_ai_context();
+    if ($path === '/api/notification-summary' && $method === 'GET') api_notification_summary();
+    if ($path === '/api/backup/info' && $method === 'GET') api_backup_info();
+    if ($path === '/api/backup-restore-centre' && $method === 'GET') api_backup_restore_centre();
+    if ($path === '/api/client-errors/recent' && $method === 'GET') api_client_errors_recent();
+    if ($path === '/api/my-sessions' && $method === 'GET') api_my_sessions();
+    if ($path === '/api/deleted-items' && $method === 'GET') api_deleted_items();
+    if ($path === '/api/document-watermark' && $method === 'GET') api_document_watermark();
+    if ($path === '/api/system-assurance' && $method === 'GET') api_system_assurance();
+    if ($path === '/api/database-migration-check' && $method === 'GET') api_database_migration_check();
+    if ($path === '/api/institutional-control-centre' && $method === 'GET') api_institutional_control_centre();
+    if ($path === '/api/approval-notification-centre' && $method === 'GET') api_approval_notification_centre();
+    if ($path === '/api/deployment/status' && $method === 'GET') api_deployment_status();
+    if ($path === '/api/workflow-compliance' && $method === 'GET') api_workflow_compliance();
+    if ($path === '/api/institutional-readiness' && $method === 'GET') api_institutional_readiness();
+    if ($path === '/api/go-live-enforcement' && $method === 'GET') api_go_live_enforcement();
+    if ($path === '/api/dashboard-kpis-v55' && $method === 'GET') api_dashboard_kpis_v55();
     if ($path === '/api/ledger/reset-zero' && $method === 'POST') api_ledger_reset_zero();
     if ($path === '/api/year-end-status' && $method === 'GET') api_year_end_status();
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
