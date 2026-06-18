@@ -44,7 +44,32 @@ function db(): PDO {
     $pdo->exec("CREATE TABLE IF NOT EXISTS php_sessions (
         sid TEXT PRIMARY KEY, user_id TEXT, username TEXT, full_name TEXT, role TEXT,
         created_at TEXT DEFAULT (datetime('now')), last_active TEXT DEFAULT (datetime('now')))");
+    ensure_perf_indexes($pdo);
     return $pdo;
+}
+// Ensure the hot query indexes exist so the PHP port is fast even on a DB it owns
+// itself (the parallel-run case inherits these from the Python migration; a PHP-first
+// deployment would not). Idempotent + near-free: one catalog lookup skips it once the
+// marker index is present.
+function ensure_perf_indexes(PDO $pdo): void {
+    try {
+        if ($pdo->query("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_gl_coa' LIMIT 1")->fetchColumn()) return;
+        $idx = [
+            'general_ledger' => [['idx_gl_coa', 'coa_id'], ['idx_gl_jv', 'jv_id'], ['idx_gl_jvnum', 'jv_number'], ['idx_gl_date', 'ledger_date'], ['idx_gl_period', 'period'], ['idx_gl_coacode', 'coa_code']],
+            'actuals' => [['idx_actuals_jv', 'jv_id'], ['idx_actuals_commit', 'commitment_id'], ['idx_actuals_budget', 'budget_id'], ['idx_actuals_proj', 'project_id']],
+            'withholding_payables' => [['idx_whp_actual', 'actual_id'], ['idx_whp_status', 'status']],
+            'jv_lines' => [['idx_jvl_jv', 'jv_id']],
+            'commitments' => [['idx_cmt_proj', 'project_id']],
+            'fund_receipts' => [['idx_fr_proj', 'project_id']],
+            'ap_bills' => [['idx_apb_vendor', 'vendor_id'], ['idx_apb_po', 'po_id']],
+            'ar_invoices' => [['idx_ari_cust', 'customer_id']],
+        ];
+        foreach ($idx as $tbl => $cols) {
+            try { if (!$pdo->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='" . $tbl . "' LIMIT 1")->fetchColumn()) continue; } catch (Throwable $e) { continue; }
+            $have = array_column($pdo->query("PRAGMA table_info($tbl)")->fetchAll(), 'name');
+            foreach ($cols as [$name, $col]) { if (in_array($col, $have, true)) { try { $pdo->exec("CREATE INDEX IF NOT EXISTS $name ON $tbl($col)"); } catch (Throwable $e) {} } }
+        }
+    } catch (Throwable $e) {}
 }
 
 // ── Response envelope ───────────────────────────────────────────────────────
