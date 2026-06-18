@@ -91,3 +91,24 @@ expects. Performance: all GET endpoints time 2–5ms warm on a populated DB; the
 ensures its hot indexes (`ensure_perf_indexes`). SMTP: `/api/email/status` shows the
 outbox + config state; the only go-live step left is setting `SMTP_HOST/PORT/USER/
 PASSWORD/FROM` on the server (email/dunning/remittance queue gracefully until then).
+
+**Navigability audit (per-view render sweep).** A browser sweep drove all 71 `nav()`
+targets and instrumented `fetch` to catch HTTP 4xx on render (the SPA swallows these
+into empty views, so console errors alone don't reveal them). It found — and this round
+fixes — two real navigable-view **crashes** the shape-tolerant gate could not catch:
+`/api/jvs` and `/api/fund-receipts` were wrapped as `{ok,jvs}` / `{ok,receipts}` but the
+SPA's JV and Receipts views do `jvs.forEach(...)` / `receipts.reduce(...)` on a bare
+array (the Python reference returns bare arrays) → both now return bare arrays. Four
+finance feeds the SPA depends on and the Python reference serves were also ported, so
+their views render fully: `/api/bank-reconciliations` (reconciliation view),
+`/api/opening-balance-wizard` (opening-balances view), `/api/changes-in-net-assets`
+(Statement of Changes in Net Assets/Equity, IPSAS 1, with prior-FY comparative) and
+`/api/notes-to-accounts` (full IPSAS-1 notes: policies, GL-derived breakdowns, PP&E
+movement schedule IPSAS 17.88, segment note IPSAS 18, commitments/contingencies IPSAS 19,
+related parties IPSAS 20, compliance statement — ties to the SFP balance-sheet identity
+and cross-ties to the I&E statement). Remaining render-time 404s are NON-regressions:
+they are endpoints the **Python reference also 404s** (`/api/opening-balances/list`) or
+pure global chrome (`/api/app-version`, `/api/notification-summary`, `/api/ai/context`,
+`/api/document-watermark`) that degrade gracefully and never crash a view. The pure
+governance/meta views (ai-governance, quality-seal, launch-lock, system-health, …) remain
+intentionally absent (non-finance, no navigable crash).

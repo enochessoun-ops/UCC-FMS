@@ -498,7 +498,10 @@ function api_jvs_list(): void {
     $u = require_auth();
     [$sw, $sp] = unit_scope_sql($u, 'journal_vouchers', $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
     $st = db()->prepare("SELECT journal_vouchers.* FROM journal_vouchers WHERE 1=1$sw ORDER BY created_at DESC, jv_number DESC");
-    $st->execute($sp); send(['ok' => true, 'jvs' => $st->fetchAll()]);
+    // The SPA's JV view does `jvs.forEach(...)` on this result, so it must be a BARE
+    // array to match the Python reference (`return rows`). Wrapping it as {ok,jvs}
+    // passes the shape-tolerant gate but crashes the front end. Keep it bare.
+    $st->execute($sp); send($st->fetchAll());
 }
 // GET /api/jvs/detail?id=… — a single JV with its lines, enforcing the same scope so a
 // scoped user cannot read another unit's voucher by id.
@@ -569,6 +572,335 @@ function api_ledger_summary(): void {
         ' GROUP BY gl.coa_id, gl.coa_code, gl.account_name, c.category, c.account_type ORDER BY gl.coa_code';
     $st = db()->prepare($q); $st->execute(array_merge($args, $sp));
     send($st->fetchAll());
+}
+
+// IPSAS 1.53 comparative window: shift a financial-year date range back by one year,
+// leap-day safe (29-Feb → 28-Feb of the prior year). Mirrors server.py _prior_fy_window
+// so the comparative on the changes-in-net-assets statement reconciles to the current FY.
+function prior_fy_window(string $df, string $dt): array {
+    $shift = function (string $s): string {
+        if (strlen($s) < 10) return $s;
+        $y = (int)substr($s, 0, 4); $m = (int)substr($s, 5, 2); $d = (int)substr($s, 8, 2);
+        if ($y === 0 || $m === 0 || $d === 0) return $s;
+        $py = $y - 1;
+        if (!checkdate($m, $d, $py)) $d -= 1; // 29-Feb in a non-leap prior year → 28-Feb
+        return sprintf('%04d-%02d-%02d', $py, $m, $d);
+    };
+    return [$shift($df), $shift($dt)];
+}
+
+// GET /api/bank-reconciliations[?account_id=…] — saved bank reconciliations with the
+// account details joined on, newest first. Bare array to match server.py
+// api_get_bank_reconciliations; the SPA reconciliation view iterates the result directly.
+function api_bank_reconciliations_list(): void {
+    require_auth();
+    $acct = $_GET['account_id'] ?? null;
+    $q = "SELECT r.*, b.account_name, b.bank_name, b.account_number
+          FROM bank_reconciliations r JOIN bank_accounts b ON r.bank_account_id=b.id";
+    $args = [];
+    if ($acct) { $q .= " WHERE r.bank_account_id=?"; $args[] = $acct; }
+    $q .= " ORDER BY r.recon_date DESC";
+    $st = db()->prepare($q); $st->execute($args);
+    send($st->fetchAll());
+}
+
+// GET /api/opening-balance-wizard — feeds the Opening Balances view: chart of accounts,
+// accounting periods and recent batches + a default start date (mirrors
+// server.py api_opening_balance_wizard; merged ok() envelope the SPA reads field-by-field).
+function api_opening_balance_wizard(): void {
+    require_auth();
+    $coa = db()->query("SELECT id,code,account_name,category,sub_category,account_type FROM chart_of_accounts ORDER BY code")->fetchAll();
+    $periods = db()->query("SELECT period,period_name,start_date,end_date,status FROM accounting_periods ORDER BY start_date DESC, period DESC")->fetchAll();
+    $hasBatch = db()->query("SELECT name FROM sqlite_master WHERE type='table' AND name='opening_balance_batches'")->fetchColumn();
+    $batches = $hasBatch ? db()->query("SELECT * FROM opening_balance_batches ORDER BY created_at DESC LIMIT 20")->fetchAll() : [];
+    ok(['version' => 'php', 'coa' => $coa, 'periods' => $periods, 'batches' => $batches, 'default_date' => '2026-01-01']);
+}
+
+// GET /api/changes-in-net-assets — Statement of Changes in Net Assets/Equity (IPSAS 1),
+// derived entirely from the GL so it reconciles to the SFP: opening net assets + surplus
+// for the period + contributed-capital movements = closing. Mirrors server.py
+// api_changes_in_net_assets_v1, incl. the prior-FY comparative on the same GL basis.
+function api_changes_in_net_assets(): void {
+    $u = require_auth();
+    $date_from = (string)($_GET['date_from'] ?? date('Y-01-01'));
+    $date_to   = (string)($_GET['date_to'] ?? date('Y-m-d'));
+    $project_id = $_GET['project_id'] ?? null;
+    [$sw, $sp] = gl_scope_sql($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
+    $extra = ''; $ep = [];
+    if ($project_id) { $extra .= ' AND gl.project_id=?'; $ep[] = $project_id; }
+    $components = function (string $cond, array $params) use ($sw, $sp, $extra, $ep) {
+        $q = "SELECT COALESCE(NULLIF(gl.coa_code,''),c.code,'') AS code,
+              COALESCE(c.category,'') AS cat, COALESCE(c.account_type,'') AS typ,
+              SUM(COALESCE(gl.debit_amount,0)) AS dr, SUM(COALESCE(gl.credit_amount,0)) AS cr
+              FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id
+              WHERE $cond$extra$sw GROUP BY code";
+        $st = db()->prepare($q); $st->execute(array_merge($params, $ep, $sp));
+        $contrib = 0.0; $income = 0.0; $expense = 0.0;
+        foreach ($st->fetchAll() as $r) {
+            $dr = (float)($r['dr'] ?? 0); $cr = (float)($r['cr'] ?? 0);
+            $c0 = substr((string)($r['code'] ?? ''), 0, 1);
+            $cat = (string)($r['cat'] ?? ''); $typ = (string)($r['typ'] ?? '');
+            if (in_array($cat, ['Equity', 'Net Assets', 'Reserves', 'Funds & Reserves'], true) || $typ === 'Equity' || $c0 === '3') {
+                $contrib += ($cr - $dr);
+            } elseif ($cat === 'Revenue' || in_array($typ, ['Income', 'Revenue'], true) || $c0 === '4') {
+                $income += ($cr - $dr);
+            } elseif ($cat === 'Expenses' || $typ === 'Expense' || $c0 === '5' || $c0 === '6') {
+                $expense += ($dr - $cr);
+            }
+        }
+        return [round($contrib, 2), round($income - $expense, 2)];
+    };
+    $movement = function (string $d_from, string $d_to) use ($components) {
+        [$c_open, $s_open] = $components('gl.ledger_date < ?', [$d_from]);
+        [$c_close, $s_close] = $components('gl.ledger_date <= ?', [$d_to]);
+        return [
+            'date_from' => $d_from, 'date_to' => $d_to,
+            'opening' => ['contributed' => $c_open, 'accumulated_surplus' => $s_open, 'total' => round($c_open + $s_open, 2)],
+            'surplus_for_period' => round($s_close - $s_open, 2),
+            'contributions' => round($c_close - $c_open, 2),
+            'closing' => ['contributed' => $c_close, 'accumulated_surplus' => $s_close, 'total' => round($c_close + $s_close, 2)],
+        ];
+    };
+    $out = $movement($date_from, $date_to);
+    [$p_from, $p_to] = prior_fy_window($date_from, $date_to);
+    $prior = $movement($p_from, $p_to);
+    $out['basis'] = 'general_ledger';
+    $out['project_id'] = $project_id;
+    $out['unit_code'] = $_GET['unit_code'] ?? null;
+    $out['comparative'] = $prior;
+    $out['prior_year'] = $prior;
+    ok($out);
+}
+
+// GET /api/notes-to-accounts — Notes to the Financial Statements (IPSAS 1): accounting
+// policies + a GL-derived, account-level breakdown of every SFP and performance line,
+// PP&E movement schedule (IPSAS 17.88), segment note by org-unit (IPSAS 18), commitments
+// and contingencies (IPSAS 19), related parties (IPSAS 20) and an unreserved IPSAS
+// compliance statement. Mirrors server.py api_notes_to_accounts; ties to the SFP / I&E.
+function api_notes_to_accounts(): void {
+    $u = require_auth();
+    $as_at = substr((string)($_GET['as_at'] ?? date('Y-m-d')), 0, 10);
+    $yr = substr($as_at, 0, 4);
+    $date_from = substr((string)($_GET['date_from'] ?? ($yr . '-01-01')), 0, 10);
+    $date_to   = substr((string)($_GET['date_to'] ?? $as_at), 0, 10);
+    [$sw, $sp] = gl_scope_sql($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
+    $pid = $_GET['project_id'] ?? null; $ucode = $_GET['unit_code'] ?? null;
+    $pre = ''; $preP = [];
+    if ($pid)   { $pre .= " AND gl.project_id=?"; $preP[] = $pid; }
+    if ($ucode) { $pre .= " AND gl.project_id IN (SELECT id FROM projects WHERE division=?)"; $preP[] = $ucode; }
+    $gf = $pre . $sw; $gfp = array_merge($preP, $sp);  // explicit filters + viewer scope
+
+    $sel = "SELECT COALESCE(NULLIF(gl.coa_code,''),c.code,'') code, c.category cat, c.account_type typ, "
+         . "c.sub_category subcat, COALESCE(gl.account_name,c.account_name,'') nm, "
+         . "SUM(COALESCE(gl.debit_amount,0)) dr, SUM(COALESCE(gl.credit_amount,0)) cr "
+         . "FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id ";
+    $bsSt = db()->prepare($sel . "WHERE gl.ledger_date<=? $gf GROUP BY code, nm");
+    $bsSt->execute(array_merge([$as_at], $gfp)); $bs = $bsSt->fetchAll();
+    $plSt = db()->prepare($sel . "WHERE gl.ledger_date BETWEEN ? AND ? $gf GROUP BY code, nm");
+    $plSt->execute(array_merge([$date_from, $date_to], $gfp)); $pl = $plSt->fetchAll();
+
+    $nat = function (string $code, string $cat, string $typ): string {
+        $c0 = substr($code, 0, 1);
+        if ($cat === 'Assets' || $typ === 'Asset' || $c0 === '1') return 'A';
+        if ($cat === 'Liabilities' || $typ === 'Liability' || $c0 === '2') return 'L';
+        if (in_array($cat, ['Equity', 'Net Assets', 'Reserves'], true) || $typ === 'Equity' || $c0 === '3') return 'Q';
+        if ($cat === 'Revenue' || in_array($typ, ['Income', 'Revenue'], true) || $c0 === '4') return 'R';
+        if ($cat === 'Expenses' || $typ === 'Expense' || $c0 === '5' || $c0 === '6') return 'E';
+        return '?';
+    };
+    $cash = []; $recv = []; $inv = []; $ppe_cost = []; $ppe_dep = []; $intang = [];
+    $pay_trade = []; $pay_stat = []; $deferred = []; $equity = [];
+    $add = function (array &$lst, string $code, string $nm, float $amt): void {
+        if (abs($amt) > 0.005) $lst[] = ['code' => $code, 'label' => $nm !== '' ? $nm : $code, 'amount' => round($amt, 2)];
+    };
+    foreach ($bs as $r) {
+        $code = (string)($r['code'] ?? ''); $nm = (string)($r['nm'] ?? ''); $nml = strtolower($nm);
+        $dr = (float)($r['dr'] ?? 0); $cr = (float)($r['cr'] ?? 0);
+        $n = $nat($code, (string)($r['cat'] ?? ''), (string)($r['typ'] ?? ''));
+        if ($n === 'A') {
+            $bal = $dr - $cr; $c3 = substr($code, 0, 3); $c4 = substr($code, 0, 4);
+            $isCash = in_array($c3, ['126', '127'], true) || $c4 === '1001' || $c4 === '1290' || $code === '12300002';
+            if (!$isCash) foreach (['bank', 'cash', 'momo', 'mobile money', 'imprest'] as $k) { if (strpos($nml, $k) !== false) { $isCash = true; break; } }
+            if ($isCash) $add($cash, $code, $nm, $bal);
+            elseif (strpos($nml, 'depreciation') !== false || strpos($nml, 'amortis') !== false || strpos($nml, 'amortiz') !== false || $c3 === '119') $add($ppe_dep, $code, $nm, -$bal);
+            elseif ($c3 === '111') $add($ppe_cost, $code, $nm, $bal);
+            elseif ($c3 === '112') $add($intang, $code, $nm, $bal);
+            elseif ($c3 === '121') $add($inv, $code, $nm, $bal);
+            else $add($recv, $code, $nm, $bal);
+        } elseif ($n === 'L') {
+            $bal = $cr - $dr; $c3 = substr($code, 0, 3);
+            $isDef = $c3 === '225';
+            if (!$isDef) foreach (['deferred', 'fund held', 'restricted', 'grant'] as $k) { if (strpos($nml, $k) !== false) { $isDef = true; break; } }
+            $isStat = in_array($code, ['21100017', '21100015', '21100014', '21100024', '21100027'], true);
+            if (!$isStat) foreach (['paye', 'ssnit', 'withhold', 'vat', 'common fund', 'social security'] as $k) { if (strpos($nml, $k) !== false) { $isStat = true; break; } }
+            if (!$isStat && strncmp($nml, 'wht', 3) === 0) $isStat = true;
+            if ($isDef) $add($deferred, $code, $nm, $bal);
+            elseif ($isStat) $add($pay_stat, $code, $nm, $bal);
+            else $add($pay_trade, $code, $nm, $bal);
+        } elseif ($n === 'Q') {
+            $add($equity, $code, $nm, $cr - $dr);
+        }
+    }
+    $rev = []; $exp_groups = [];
+    foreach ($pl as $r) {
+        $code = (string)($r['code'] ?? ''); $nm = (string)($r['nm'] ?? '');
+        $dr = (float)($r['dr'] ?? 0); $cr = (float)($r['cr'] ?? 0);
+        $n = $nat($code, (string)($r['cat'] ?? ''), (string)($r['typ'] ?? ''));
+        if ($n === 'R') $add($rev, $code, $nm, $cr - $dr);
+        elseif ($n === 'E') { $g = (string)($r['subcat'] ?? '') ?: 'Other expenditure'; if (!isset($exp_groups[$g])) $exp_groups[$g] = []; $add($exp_groups[$g], $code, $nm, $dr - $cr); }
+    }
+    $tot = function (array $lst): float { $s = 0.0; foreach ($lst as $x) $s += $x['amount']; return round($s, 2); };
+    $income_total = $tot($rev);
+    $expense_total = 0.0; foreach ($exp_groups as $v) $expense_total += $tot($v); $expense_total = round($expense_total, 2);
+    $surplus = round($income_total - $expense_total, 2);
+    $ppe_cost_t = $tot($ppe_cost); $ppe_dep_t = $tot($ppe_dep);
+    $equity_lines = array_merge($equity, [['code' => '', 'label' => 'Accumulated surplus / (deficit) for the period and prior years', 'amount' => $surplus]]);
+
+    $notes = [];
+    $note = function (int $num, string $title, string $basis, array $lines, $total = null, ?string $narr = null, ?array $extra = null) use ($tot): array {
+        $d = ['number' => $num, 'title' => $title, 'basis' => $basis, 'lines' => $lines, 'total' => $total !== null ? $total : $tot($lines)];
+        if ($narr) $d['narrative'] = $narr;
+        if ($extra) $d['extra'] = $extra;
+        return $d;
+    };
+    $notes[] = $note(1, 'Cash and cash equivalents', 'As at ' . $as_at, $cash, null,
+        'Cash and cash equivalents comprise balances with banks, cash on hand, mobile-money floats, accountable imprest and special advances that are readily convertible to known amounts of cash (IPSAS 2).');
+    $notes[] = $note(2, 'Receivables, prepayments and advances', 'As at ' . $as_at, $recv, null,
+        'Receivables are stated at amortised cost less any impairment. Includes staff and student debtors, prepayments and recoverable advances (IPSAS 29 / IFRS 9).');
+    if ($inv) $notes[] = $note(count($notes) + 1, 'Inventories', 'As at ' . $as_at, $inv, null,
+        'Inventories (including fuel-coupon stock) are measured at the lower of cost and net realisable value, cost determined on a weighted-average basis (IPSAS 12).');
+    $notes[] = $note(count($notes) + 1, 'Property, plant and equipment', 'As at ' . $as_at,
+        array_merge($ppe_cost, [['code' => '', 'label' => 'Less: accumulated depreciation', 'amount' => -$ppe_dep_t]]),
+        round($ppe_cost_t - $ppe_dep_t, 2),
+        'PP&E is carried at cost less accumulated depreciation and impairment. Depreciation is on a straight-line basis over useful lives (IPSAS 17).',
+        ['cost' => $ppe_cost_t, 'accumulated_depreciation' => $ppe_dep_t, 'net_book_value' => round($ppe_cost_t - $ppe_dep_t, 2)]);
+    if ($intang) $notes[] = $note(count($notes) + 1, 'Intangible assets', 'As at ' . $as_at, $intang, null,
+        'Intangible assets are carried at cost less amortisation (IPSAS 31).');
+    $notes[] = $note(count($notes) + 1, 'Payables and accruals', 'As at ' . $as_at, $pay_trade, null,
+        'Trade and other payables and accrued expenses are stated at amortised cost and represent obligations for goods and services received before period-end.');
+    if ($pay_stat) $notes[] = $note(count($notes) + 1, 'Statutory and tax liabilities', 'As at ' . $as_at, $pay_stat, null,
+        'Amounts withheld and due to statutory bodies — PAYE and SSNIT (employees), and withholding tax, withholding VAT and the UCC Common Fund deducted from payments to suppliers — pending remittance to GRA / SSNIT.');
+    if ($deferred) $notes[] = $note(count($notes) + 1, 'Deferred income and funds held on behalf', 'As at ' . $as_at, $deferred, null,
+        'Restricted donor/grant funds and project balances are recognised as deferred income (a liability) and released to revenue as the related conditions are met (IPSAS 23).');
+    $notes[] = $note(count($notes) + 1, 'Accumulated fund and reserves', 'As at ' . $as_at, $equity_lines, null,
+        'The accumulated fund represents the residual interest in the assets after deducting liabilities, comprising contributed/opening funds and accumulated surpluses.');
+    $notes[] = $note(count($notes) + 1, 'Revenue', 'For the period ' . $date_from . ' to ' . $date_to, $rev, null,
+        'Revenue is recognised on the accrual basis to the extent that the entity controls the resources, it is probable that economic benefits will flow, and the amount can be measured reliably (IPSAS 9 / IPSAS 23).');
+    $exp_lines = []; $expKeys = array_keys($exp_groups); sort($expKeys);
+    foreach ($expKeys as $grp) $exp_lines[] = ['code' => '', 'label' => $grp, 'amount' => $tot($exp_groups[$grp]), 'group' => true, 'children' => $exp_groups[$grp]];
+    $notes[] = $note(count($notes) + 1, 'Expenditure', 'For the period ' . $date_from . ' to ' . $date_to, $exp_lines, $expense_total,
+        'Expenditure is recognised on the accrual basis when goods/services are received. Grouped by expenditure class.');
+
+    // PP&E movement schedule (IPSAS 17.88) — GL-derived so it ties to the SFP PP&E line.
+    $scl = function (string $q, array $params): float {
+        try { $st = db()->prepare($q); $st->execute($params); $v = $st->fetchColumn(); return round((float)($v ?: 0), 2); }
+        catch (Throwable $e) { return 0.0; }
+    };
+    $costClause = "(COALESCE(NULLIF(gl.coa_code,''),c.code,'') LIKE '111%' OR COALESCE(NULLIF(gl.coa_code,''),c.code,'') LIKE '112%')";
+    $depClause = "(COALESCE(NULLIF(gl.coa_code,''),c.code,'') LIKE '119%' "
+        . "OR LOWER(COALESCE(gl.account_name,c.account_name,'')) LIKE '%depreciation%' "
+        . "OR LOWER(COALESCE(gl.account_name,c.account_name,'')) LIKE '%amortis%' "
+        . "OR LOWER(COALESCE(gl.account_name,c.account_name,'')) LIKE '%amortiz%')";
+    $pbase = "FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id WHERE ";
+    $cost_open = $scl("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) " . $pbase . $costClause . " AND gl.ledger_date < ? $gf", array_merge([$date_from], $gfp));
+    $additions = $scl("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)),0) " . $pbase . $costClause . " AND gl.ledger_date BETWEEN ? AND ? $gf", array_merge([$date_from, $date_to], $gfp));
+    $disposals = $scl("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)),0) " . $pbase . $costClause . " AND gl.ledger_date BETWEEN ? AND ? $gf", array_merge([$date_from, $date_to], $gfp));
+    $cost_close = round($cost_open + $additions - $disposals, 2);
+    $dep_open = $scl("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0)),0) " . $pbase . $depClause . " AND gl.ledger_date < ? $gf", array_merge([$date_from], $gfp));
+    $dep_charge = $scl("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)),0) " . $pbase . $depClause . " AND gl.ledger_date BETWEEN ? AND ? $gf", array_merge([$date_from, $date_to], $gfp));
+    $dep_disp = $scl("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)),0) " . $pbase . $depClause . " AND gl.ledger_date BETWEEN ? AND ? $gf", array_merge([$date_from, $date_to], $gfp));
+    $dep_close = round($dep_open + $dep_charge - $dep_disp, 2);
+    $ppe_movement = [
+        'cost' => ['opening' => $cost_open, 'additions' => $additions, 'disposals' => $disposals, 'closing' => $cost_close],
+        'accumulated_depreciation' => ['opening' => $dep_open, 'charge_for_period' => $dep_charge, 'disposals' => $dep_disp, 'closing' => $dep_close],
+        'net_book_value' => ['opening' => round($cost_open - $dep_open, 2), 'closing' => round($cost_close - $dep_close, 2)],
+    ];
+
+    // Segment note BY UNIT (IPSAS 18) — org_units tree is the segmentation basis.
+    $segments = [];
+    try {
+        $segSt = db()->prepare(
+            "SELECT COALESCE(ou.code,'UNASSIGNED') AS ucode, COALESCE(ou.name,'Unassigned / shared') AS uname, "
+            . "COALESCE(SUM(CASE WHEN (COALESCE(NULLIF(gl.coa_code,''),c.code,'') LIKE '4%' OR c.category='Revenue' OR c.account_type IN ('Income','Revenue')) THEN COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0) ELSE 0 END),0) AS rev, "
+            . "COALESCE(SUM(CASE WHEN (COALESCE(NULLIF(gl.coa_code,''),c.code,'') LIKE '5%' OR COALESCE(NULLIF(gl.coa_code,''),c.code,'') LIKE '6%' OR c.category='Expenses' OR c.account_type='Expense') THEN COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0) ELSE 0 END),0) AS exp "
+            . "FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id LEFT JOIN org_units ou ON ou.id=gl.unit_id "
+            . "WHERE gl.ledger_date BETWEEN ? AND ? $gf GROUP BY ucode, uname ORDER BY ucode");
+        $segSt->execute(array_merge([$date_from, $date_to], $gfp));
+        foreach ($segSt->fetchAll() as $r) {
+            $rv = round((float)($r['rev'] ?? 0), 2); $ex = round((float)($r['exp'] ?? 0), 2);
+            if (abs($rv) > 0.005 || abs($ex) > 0.005)
+                $segments[] = ['unit_code' => $r['ucode'], 'unit_name' => $r['uname'], 'revenue' => $rv, 'expenditure' => $ex, 'surplus_deficit' => round($rv - $ex, 2)];
+        }
+    } catch (Throwable $e) { $segments = []; }
+    $sgRev = 0.0; $sgExp = 0.0; $sgSur = 0.0;
+    foreach ($segments as $s) { $sgRev += $s['revenue']; $sgExp += $s['expenditure']; $sgSur += $s['surplus_deficit']; }
+    $segment_note = ['number' => count($notes) + 1, 'title' => 'Segment information (by organisational unit)',
+        'basis' => 'For the period ' . $date_from . ' to ' . $date_to, 'segments' => $segments,
+        'total_revenue' => round($sgRev, 2), 'total_expenditure' => round($sgExp, 2), 'total_surplus_deficit' => round($sgSur, 2),
+        'narrative' => 'Segments are the self-accounting organisational units of the University (faculties, schools, directorates and centres) per the approved org-unit structure. Amounts not yet assigned to a unit are shown as a single unallocated segment (IPSAS 18).'];
+
+    // Open commitments disclosure (appropriation ledger).
+    $commit_lines = [];
+    try {
+        $cmSt = db()->query("SELECT p.project_code pc, COALESCE(SUM(cm.amount_ghs),0) amt FROM commitments cm LEFT JOIN projects p ON p.id=cm.project_id WHERE cm.status='Open' GROUP BY p.project_code HAVING amt>0");
+        foreach ($cmSt->fetchAll() as $r) $commit_lines[] = ['code' => '', 'label' => 'Open commitments — ' . ($r['pc'] ?: 'General'), 'amount' => round((float)($r['amt'] ?? 0), 2)];
+    } catch (Throwable $e) { /* commitments table optional */ }
+    $total_commitments = $tot($commit_lines);
+
+    // Provisions recognised (IPSAS 19) feeding the contingencies note.
+    $provisions_lines = [];
+    foreach ($bs as $r) {
+        $code = (string)($r['code'] ?? ''); $nm = (string)($r['nm'] ?? ''); $nml = strtolower($nm);
+        if (substr($code, 0, 3) === '215' || strpos($nml, 'provision') !== false)
+            $add($provisions_lines, $code, $nm, (float)($r['cr'] ?? 0) - (float)($r['dr'] ?? 0));
+    }
+    $provisions_total = $tot($provisions_lines);
+
+    $related_parties = ['number' => 0, 'title' => 'Related-party disclosures',
+        'narrative' => 'The reporting unit is controlled by the University of Cape Coast, whose ultimate controlling party is the Government of Ghana. Related parties comprise the Government of Ghana and its ministries and agencies (GETFund, NCTE/GTEC, Ministry of Education and the Ghana Revenue Authority), the University Council and the University management as the key management personnel, and other self-accounting units of the University. Transactions with related parties — Government subventions and GETFund grants, statutory remittances to the Ghana Revenue Authority and SSNIT, and inter-unit allocations — are conducted on normal public-sector terms (IPSAS 20).',
+        'parties' => [
+            ['party' => 'Government of Ghana', 'relationship' => 'Ultimate controlling party / principal funder', 'nature' => 'Recurrent subvention, GETFund recurrent and development grants'],
+            ['party' => 'University Council', 'relationship' => 'Governing body / oversight', 'nature' => 'Approval of budgets, financial statements and key policies'],
+            ['party' => 'University management (key management personnel)', 'relationship' => 'Key management personnel', 'nature' => 'Remuneration recognised within employee costs; no other material transactions'],
+            ['party' => 'Ghana Revenue Authority / SSNIT', 'relationship' => 'Statutory bodies', 'nature' => 'Remittance of PAYE, withholding taxes and social-security contributions'],
+        ]];
+    $contingencies = ['number' => 0, 'title' => 'Contingent liabilities and capital/other commitments',
+        'narrative' => 'Capital and operating commitments comprise approved but unpaid purchase commitments (open commitments on the appropriation ledger). Provisions recognised on the face of the statement of financial position (e.g. the provision for audit fees) are remeasured at each reporting date. Save for the matters disclosed below, the unit is not aware of any material contingent liabilities or pending litigation at the reporting date (IPSAS 19).',
+        'commitments' => $commit_lines, 'commitments_total' => $total_commitments,
+        'provisions' => $provisions_lines, 'provisions_total' => $provisions_total, 'pending_litigation' => []];
+    $compliance_statement = ['title' => 'Statement of compliance with IPSAS',
+        'body' => 'These financial statements have been prepared in accordance with, and comply with, International Public Sector Accounting Standards (IPSAS) on the accrual basis of accounting. As required by IPSAS 1.28, the unit makes an explicit and unreserved statement of compliance: these financial statements comply with all the requirements of the applicable IPSAS in all material respects.'];
+    $entity_name = (string)(setting_get('institution_name', 'University of Cape Coast') ?? 'University of Cape Coast');
+    $policies = [
+        ['title' => 'Reporting entity', 'body' => 'These financial statements are for ' . $entity_name . ', a self-accounting unit of the University of Cape Coast, Ghana.'],
+        ['title' => 'Basis of preparation', 'body' => 'The financial statements are prepared on the accrual basis of accounting and in accordance with International Public Sector Accounting Standards (IPSAS), supplemented by IFRS where IPSAS is silent, and the going-concern assumption. They are presented in Ghana Cedis (GHS), the functional currency.'],
+        ['title' => 'Property, plant and equipment', 'body' => 'PP&E is stated at historical cost less accumulated depreciation and impairment losses. Depreciation is charged on a straight-line basis to write off the cost over the estimated useful life of each asset (IPSAS 17).'],
+        ['title' => 'Inventories', 'body' => 'Inventories, including fuel-coupon stock held for issue, are measured at the lower of cost and net realisable value (IPSAS 12).'],
+        ['title' => 'Revenue recognition', 'body' => 'Exchange revenue is recognised when control of services/goods passes. Non-exchange revenue (grants, subventions, donations) is recognised when the entity gains control of the resources and conditions, if any, are satisfied; conditional grants are deferred until conditions are met (IPSAS 9 / 23).'],
+        ['title' => 'Employee benefits and taxes', 'body' => 'Salaries, PAYE and SSNIT contributions are recognised in the period the related service is rendered. Withholding tax, withholding VAT and the UCC Common Fund are deducted at source on qualifying payments and held as liabilities until remitted to the Ghana Revenue Authority.'],
+        ['title' => 'Financial instruments', 'body' => 'Financial assets (receivables, cash) and financial liabilities (payables) are recognised at amortised cost. Receivables are assessed for impairment at each reporting date (IPSAS 41 / IFRS 9).'],
+    ];
+
+    foreach ($notes as &$_n) { if (($_n['title'] ?? '') === 'Property, plant and equipment') { if (!isset($_n['extra'])) $_n['extra'] = []; $_n['extra']['movement'] = $ppe_movement; break; } }
+    unset($_n);
+    $related_parties['number'] = count($notes) + 1; $notes[] = $related_parties;
+    $segment_note['number'] = count($notes) + 1;    $notes[] = $segment_note;
+    $contingencies['number'] = count($notes) + 1;   $notes[] = $contingencies;
+
+    ok([
+        'entity' => ['name' => $entity_name, 'parent' => 'University of Cape Coast, Ghana'],
+        'as_at' => $as_at, 'period_from' => $date_from, 'period_to' => $date_to,
+        'compliance_statement' => $compliance_statement, 'policies' => $policies, 'notes' => $notes,
+        'ppe_movement' => $ppe_movement, 'related_parties' => $related_parties,
+        'segments' => $segment_note, 'contingencies' => $contingencies, 'commitments' => $commit_lines,
+        'reconciliation' => [
+            'total_assets' => round($tot($cash) + $tot($recv) + $tot($inv) + ($ppe_cost_t - $ppe_dep_t) + $tot($intang), 2),
+            'total_liabilities' => round($tot($pay_trade) + $tot($pay_stat) + $tot($deferred), 2),
+            'net_assets' => round($tot($equity) + $surplus, 2),
+            'income' => $income_total, 'expenditure' => $expense_total, 'surplus' => $surplus,
+        ],
+        'basis' => 'general_ledger',
+    ]);
 }
 
 // GET /api/trial-balance — AS-AT trial balance straight from the general ledger
@@ -1057,7 +1389,9 @@ function api_fund_receipts_list(): void {
     $u = require_auth(); ensure_col('fund_receipts', 'unit_id');
     [$sw, $sp] = unit_scope_sql($u, 'fund_receipts', $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
     $st = db()->prepare("SELECT fund_receipts.* FROM fund_receipts WHERE 1=1$sw ORDER BY created_at DESC");
-    $st->execute($sp); send(['ok' => true, 'receipts' => $st->fetchAll()]);
+    // Bare array to match Python (`send_json(rows)`): the SPA's receipts view does
+    // `receipts.reduce(...)`. {ok,receipts} satisfies the tolerant gate but crashes the UI.
+    $st->execute($sp); send($st->fetchAll());
 }
 function api_fund_receipt_save(): void {
     $u = require_role(['Admin', 'Finance Officer', 'Project Leader']);
@@ -4353,6 +4687,10 @@ try {
     if ($path === '/api/income-expenditure' && $method === 'GET') api_income_expenditure();
     if ($path === '/api/sfp' && $method === 'GET') api_sfp();
     if ($path === '/api/cashflow' && $method === 'GET') api_cashflow();
+    if ($path === '/api/changes-in-net-assets' && $method === 'GET') api_changes_in_net_assets();
+    if ($path === '/api/notes-to-accounts' && $method === 'GET') api_notes_to_accounts();
+    if ($path === '/api/bank-reconciliations' && $method === 'GET') api_bank_reconciliations_list();
+    if ($path === '/api/opening-balance-wizard' && $method === 'GET') api_opening_balance_wizard();
     if ($path === '/api/ledger/reset-zero' && $method === 'POST') api_ledger_reset_zero();
     if ($path === '/api/year-end-status' && $method === 'GET') api_year_end_status();
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
