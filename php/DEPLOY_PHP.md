@@ -77,6 +77,11 @@ location ~ \.(db|sqlite3?|db-wal|db-shm)$ { deny all; }
 ```
 
 ## What is NOT in the PHP port yet (non-gate)
-The backend passes the full finance gate. Remaining work before a hard cut-over:
-SPA click-through QA against the PHP backend, load/perf profiling, and SMTP wiring
-for the email/dunning/remittance features (they queue gracefully when SMTP is off).
+The backend passes the full finance gate. Browser QA against the PHP backend has
+been run for the main path: login → dashboard renders with live data, zero console
+errors, and every SPA list endpoint the UI iterates (`departments`, `dept-summary`,
+`vendors`, `approvals`, `fuel-vehicles`, `procure-to-pay`, `attachments`, …) now
+returns the bare-array shape the SPA expects (these were added/aligned during QA).
+Remaining before a hard cut-over: a full click-through of every leaf view, load/perf
+profiling, and SMTP wiring for the email/dunning/remittance features (they queue
+gracefully when SMTP is off).
