@@ -3024,6 +3024,61 @@ function api_pc2_void(): void {
     db()->prepare("UPDATE petty_cash_vouchers SET status='Voided' WHERE id=?")->execute([$vid]);
     ok(['voided' => $vid, 'book_balance' => pc_book_balance((string)$vc['float_id'])]);
 }
+// Correct a float's imprest level (audit-safe): post the cash movement to/from bank
+// and update the imprest so the book balance and the GL stay tied.
+function api_pc2_float_edit(): void {
+    ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $fid = (string)($d['float_id'] ?? ($d['id'] ?? '')); if ($fid === '') err('float_id is required');
+    $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch(); if (!$fl) err('Float not found');
+    $new = round((float)($d['new_imprest_amount'] ?? ($d['imprest_amount'] ?? 0)), 2); if ($new <= 0) err('new_imprest_amount must be greater than zero');
+    $old = round((float)$fl['imprest_amount'], 2); $delta = round($new - $old, 2);
+    if (abs($delta) < 0.005) { db()->prepare('UPDATE petty_cash_floats SET imprest_amount=? WHERE id=?')->execute([$new, $fid]); ok(['id' => $fid, 'imprest_amount' => $new, 'book_balance' => pc_book_balance($fid)]); }
+    $bankc = bank_coa_from_account((string)($d['bank_account_id'] ?? ($fl['bank_account_id'] ?? ''))); if (!$bankc) { $b = operating_bank_coa(); $bankc = $b['id'] ?? null; }
+    if (!$bankc) err('Bank account could not be resolved');
+    $date = substr((string)($d['date'] ?? date('Y-m-d')), 0, 10);
+    if ($delta > 0) $lines = [['coa_id' => $fl['coa_id'], 'debit_amount' => $delta, 'credit_amount' => 0, 'description' => 'Increase petty cash float — ' . $fl['name']],
+                              ['coa_id' => $bankc, 'debit_amount' => 0, 'credit_amount' => $delta, 'description' => 'Cash to increase float ' . $fl['name']]];
+    else { $amt = abs($delta); $lines = [['coa_id' => $bankc, 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => 'Cash returned from float ' . $fl['name']],
+                                         ['coa_id' => $fl['coa_id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Reduce petty cash float — ' . $fl['name']]]; }
+    try { [$jid, $jvnum] = post_journal($u, 'JV', $date, substr($date, 0, 7), 'Petty cash float adjustment — ' . $fl['name'], $lines, 'petty_cash_float_adjust', $fid, $fl['unit_id'] ?? null); }
+    catch (Throwable $e) { err('Could not post the float adjustment: ' . $e->getMessage()); }
+    db()->prepare('UPDATE petty_cash_floats SET imprest_amount=? WHERE id=?')->execute([$new, $fid]);
+    ok(['id' => $fid, 'imprest_amount' => $new, 'jv_number' => $jvnum, 'book_balance' => pc_book_balance($fid)]);
+}
+// Correct a disbursement (audit-safe): void the original (reverse its JV) and re-issue
+// a corrected voucher in one action.
+function api_pc2_voucher_edit(): void {
+    ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $vid = (string)($d['id'] ?? ($d['voucher_id'] ?? '')); if ($vid === '') err('id is required');
+    $v = db()->prepare('SELECT * FROM petty_cash_vouchers WHERE id=?'); $v->execute([$vid]); $vc = $v->fetch(); if (!$vc) err('Voucher not found');
+    if ((string)($vc['status'] ?? '') === 'Voided') err('Voucher already voided');
+    $norm = [];
+    foreach (($d['lines'] ?? []) as $ln) { $a = round((float)($ln['amount_ghs'] ?? ($ln['amount'] ?? 0)), 2); $coa = $ln['expense_coa_id'] ?? ($ln['coa_id'] ?? null); if ($a > 0 && $coa) $norm[] = ['coa_id' => $coa, 'amount' => $a, 'description' => trim((string)($ln['description'] ?? ''))]; }
+    if (!$norm) err('Add at least one corrected expense line');
+    $amt = round(array_sum(array_column($norm, 'amount')), 2);
+    $fid = (string)$vc['float_id'];
+    $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch(); if (!$fl) err('Float not found');
+    // Void: reverse the original voucher's journal.
+    $g = db()->prepare('SELECT * FROM general_ledger WHERE jv_number=?'); $g->execute([$vc['jv_number']]); $rows = $g->fetchAll();
+    if ($rows) { $rd = (string)$vc['voucher_date']; $rl = []; foreach ($rows as $r) $rl[] = ['coa_id' => $r['coa_id'], 'debit_amount' => money($r['credit_amount']), 'credit_amount' => money($r['debit_amount']), 'description' => 'Void PCV ' . (string)($vc['pcv_number'] ?? '')];
+        try { post_journal($u, 'JV', $rd, substr($rd, 0, 7), 'Void petty cash voucher ' . (string)($vc['pcv_number'] ?? ''), $rl, 'petty_cash_void', $vid, $vc['unit_id'] ?? null); } catch (Throwable $e) {} }
+    db()->prepare("UPDATE petty_cash_vouchers SET status='Voided' WHERE id=?")->execute([$vid]);
+    // Re-issue: post the corrected disbursement (Dr each expense / Cr float).
+    $payee = trim((string)($d['payee'] ?? $vc['payee'])); $vdate = substr((string)($d['voucher_date'] ?? $vc['voucher_date']), 0, 10);
+    $bal = pc_book_balance($fid);
+    if ($amt > $bal + 0.001) err(sprintf('Insufficient float balance for the corrected voucher: available GHS %.2f, voucher GHS %.2f.', $bal, $amt));
+    $lines = []; foreach ($norm as $n) $lines[] = ['coa_id' => $n['coa_id'], 'debit_amount' => $n['amount'], 'credit_amount' => 0, 'description' => ($n['description'] ?: ('Petty cash: ' . $payee))];
+    $lines[] = ['coa_id' => $fl['coa_id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Disbursed from float ' . $fl['name']];
+    $unit = ($fl['unit_id'] ?? null) ?: resolve_write_unit($u, $d);
+    try { [$jid, $jvnum] = post_journal($u, 'JV', $vdate, substr($vdate, 0, 7), 'Petty cash voucher (reissue) — ' . $payee, $lines, 'petty_cash_voucher', $fid, $unit); }
+    catch (Throwable $e) { err('Could not post the reissued voucher: ' . $e->getMessage()); }
+    $nvid = uuid4(); $pcv = seq_code('petty_cash_vouchers', 'pcv_number', 'PCV-', 4);
+    db()->prepare("INSERT INTO petty_cash_vouchers(id,float_id,pcv_number,voucher_date,payee,description,expense_coa_id,amount_ghs,status,jv_number,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,'Posted',?,?,?)")
+        ->execute([$nvid, $fid, $pcv, $vdate, $payee, $d['description'] ?? '', $norm[0]['coa_id'], $amt, $jvnum, $u['username'], $unit]);
+    $ln = 0; $li = db()->prepare("INSERT INTO petty_cash_voucher_lines(id,voucher_id,line_no,expense_coa_id,amount_ghs,description) VALUES(?,?,?,?,?,?)");
+    foreach ($norm as $n) { $ln++; $li->execute([uuid4(), $nvid, $ln, $n['coa_id'], $n['amount'], $n['description']]); }
+    ok(['id' => $nvid, 'pcv_number' => $pcv, 'jv_number' => $jvnum, 'voided' => $vid, 'amount_ghs' => $amt, 'total_ghs' => $amt, 'lines' => count($norm)]);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3c (payroll) — Ghana PAYE (graduated bands) + 3-tier SSNIT + GRA reliefs.
@@ -3646,6 +3701,10 @@ function api_redate_reversal(): void {
     db()->prepare('UPDATE journal_vouchers SET jv_date=?, period=? WHERE id=?')->execute([$new_date, $new_period, $jv['id']]);
     $st = db()->prepare('UPDATE general_ledger SET ledger_date=?, period=? WHERE jv_id=?'); $st->execute([$new_date, $new_period, $jv['id']]);
     $moved = $st->rowCount();
+    // Keep the source voucher's own date in step with its re-dated posting.
+    $updAct = $aid;
+    if ($updAct === '' && (string)($jv['source_module'] ?? '') === 'actuals' && !empty($jv['source_id'])) $updAct = (string)$jv['source_id'];
+    if ($updAct !== '') { try { db()->prepare('UPDATE actuals SET expense_date=? WHERE id=?')->execute([$new_date, $updAct]); } catch (Throwable $e) {} }
     ok(['jv_number' => $jvn, 'new_date' => $new_date, 'new_period' => $new_period, 'ledger_lines_moved' => $moved]);
 }
 
@@ -3952,6 +4011,8 @@ try {
     if ($path === '/api/petty-cash2/voucher' && $method === 'POST') api_pc2_voucher();
     if ($path === '/api/petty-cash2/replenish' && $method === 'POST') api_pc2_replenish();
     if ($path === '/api/petty-cash2/voucher/void' && $method === 'POST') api_pc2_void();
+    if ($path === '/api/petty-cash2/float/edit' && $method === 'POST') api_pc2_float_edit();
+    if ($path === '/api/petty-cash2/voucher/edit' && $method === 'POST') api_pc2_voucher_edit();
     if ($path === '/api/petty-cash2/ledger' && $method === 'GET') api_pc2_ledger();
 
     // Phase 3e — financial statements (GL-derived)
