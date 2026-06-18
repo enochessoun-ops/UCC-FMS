@@ -144,7 +144,12 @@ function api_login(): void {
     $st = db()->prepare('SELECT * FROM users WHERE username=? AND active=1'); $st->execute([$username]); $user = $st->fetch();
     if (!$user || !hash_equals((string)$user['password_hash'], hash('sha256', $password))) { throttle_fail($username); err('Invalid credentials'); }
     throttle_reset($username);
-    if (mfa_secret($username)) { ok(['mfa_required' => true, 'username' => $username]); } // step-up: verify TOTP next
+    if (mfa_secret($username)) {
+        // Step-up: issue a one-time challenge; the client verifies a TOTP code against it. No session yet.
+        db()->exec("CREATE TABLE IF NOT EXISTS php_mfa_challenges(challenge_id TEXT PRIMARY KEY, username TEXT, created_at TEXT DEFAULT(datetime('now')))");
+        $cid = uuid4(); db()->prepare('INSERT INTO php_mfa_challenges(challenge_id,username) VALUES(?,?)')->execute([$cid, $username]);
+        ok(['mfa_required' => true, 'username' => $username, 'challenge_id' => $cid]);
+    }
     $sid = start_session($user);
     ok(['sid' => $sid, 'user' => ['username' => $user['username'], 'full_name' => $user['full_name'], 'role' => $user['role'],
         'home_unit_id' => $user['home_unit_id'] ?? null, 'scope' => $user['scope'] ?? null]]);
@@ -164,6 +169,37 @@ function api_mfa_enroll(): void {
     $map = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; $secret = ''; for ($i = 0; $i < 16; $i++) $secret .= $map[random_int(0, 31)];
     db()->prepare('INSERT INTO php_mfa(username,enabled,secret) VALUES(?,1,?) ON CONFLICT(username) DO UPDATE SET enabled=1, secret=excluded.secret')->execute([$u['username'], $secret]);
     ok(['secret' => $secret, 'otpauth' => 'otpauth://totp/UCC-FMS:' . $u['username'] . '?secret=' . $secret . '&issuer=UCC-FMS']);
+}
+// Begin TOTP enrolment: generate a PENDING secret (enabled=0) — confirm with a code to activate.
+function api_mfa_totp_setup(): void {
+    $u = require_auth(); ensure_security_tables();
+    $map = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'; $secret = ''; for ($i = 0; $i < 16; $i++) $secret .= $map[random_int(0, 31)];
+    db()->prepare('INSERT INTO php_mfa(username,enabled,secret) VALUES(?,0,?) ON CONFLICT(username) DO UPDATE SET enabled=0, secret=excluded.secret')->execute([$u['username'], $secret]);
+    ok(['secret' => $secret, 'otpauth' => 'otpauth://totp/UCC-FMS:' . $u['username'] . '?secret=' . $secret . '&issuer=UCC-FMS']);
+}
+// Confirm enrolment: verify a code against the pending secret, then activate MFA.
+function api_mfa_totp_confirm(): void {
+    $u = require_auth(); $d = body(); ensure_security_tables();
+    $code = trim((string)($d['code'] ?? ''));
+    $r = db()->prepare('SELECT secret FROM php_mfa WHERE username=?'); $r->execute([$u['username']]); $secret = $r->fetchColumn();
+    if (!$secret) err('Start TOTP setup first');
+    if (!in_array($code, [totp_code($secret, 0), totp_code($secret, -1), totp_code($secret, 1)], true)) err('Invalid code — check your authenticator and try again');
+    db()->prepare('UPDATE php_mfa SET enabled=1 WHERE username=?')->execute([$u['username']]);
+    ok(['enabled' => true]);
+}
+// Verify a login TOTP challenge and issue the session.
+function api_security_mfa_verify(): void {
+    $d = body(); $username = trim((string)($d['username'] ?? '')); $code = trim((string)($d['code'] ?? '')); $cid = (string)($d['challenge_id'] ?? '');
+    ensure_security_tables(); db()->exec("CREATE TABLE IF NOT EXISTS php_mfa_challenges(challenge_id TEXT PRIMARY KEY, username TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    if ($cid !== '') { $cq = db()->prepare('SELECT username FROM php_mfa_challenges WHERE challenge_id=?'); $cq->execute([$cid]); $cu = $cq->fetchColumn(); if (!$cu) err('Invalid or expired MFA challenge'); $username = $username ?: (string)$cu; if ($cu !== $username) err('Challenge does not match user'); }
+    $secret = mfa_secret($username); if (!$secret) err('MFA is not enabled for this user');
+    if (!in_array($code, [totp_code($secret, 0), totp_code($secret, -1), totp_code($secret, 1)], true)) err('Invalid MFA code');
+    $st = db()->prepare('SELECT * FROM users WHERE username=? AND active=1'); $st->execute([$username]); $user = $st->fetch();
+    if (!$user) err('User not found');
+    if ($cid !== '') db()->prepare('DELETE FROM php_mfa_challenges WHERE challenge_id=?')->execute([$cid]);
+    $sid = start_session($user);
+    ok(['sid' => $sid, 'user' => ['username' => $user['username'], 'full_name' => $user['full_name'], 'role' => $user['role'],
+        'home_unit_id' => $user['home_unit_id'] ?? null, 'scope' => $user['scope'] ?? null]]);
 }
 function api_dual_control_get(): void { require_auth(); ok(['threshold' => (float)setting_get('dual_control_threshold_ghs', 0)]); }
 function api_dual_control_set(): void { require_role(['Admin']); $d = body(); setting_set('dual_control_threshold_ghs', (float)($d['threshold'] ?? 0)); ok(['threshold' => (float)($d['threshold'] ?? 0)]); }
@@ -3722,6 +3758,9 @@ try {
     if ($path === '/api/me'     && $method === 'GET')  api_me();
     if ($path === '/api/verify-mfa' && $method === 'POST') api_verify_mfa();
     if ($path === '/api/mfa/enroll' && $method === 'POST') api_mfa_enroll();
+    if ($path === '/api/mfa/totp-setup' && $method === 'POST') api_mfa_totp_setup();
+    if ($path === '/api/mfa/totp-confirm' && $method === 'POST') api_mfa_totp_confirm();
+    if ($path === '/api/security/mfa/verify' && $method === 'POST') api_security_mfa_verify();
     // Auditor accounts are strictly read-only: block every write (POST) past the auth
     // endpoints with a clear message, while GET reports and exports stay available.
     if ($method === 'POST') { $au = current_user(); if ($au && ($au['role'] ?? '') === 'Auditor') err('This account is read-only (Auditor) — writes are not permitted', 403); }
