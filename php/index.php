@@ -4180,6 +4180,226 @@ function api_budget_virement(): void {
     ok(['from_id' => $from, 'to_id' => $to, 'amount' => $amt, 'reason' => $d['reason'] ?? '']);
 }
 
+// ── Fuel coupon issuance lifecycle (procurement already posts GL; issuance/return are
+// stock movements of pre-purchased coupons, so no GL — mirror the Python reference). ──
+function api_fuel_movement_save(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $denom = (float)($d['denomination'] ?? 0); $qty = (int)($d['quantity'] ?? 0);
+    if ($denom <= 0 || $qty <= 0) err('Denomination and quantity are required');
+    $id = uuid4();
+    db()->prepare("INSERT INTO fuel_coupon_movements(id,movement_date,movement_type,batch_id,project_id,from_entity,to_entity,denomination,quantity,face_value,officer,purpose,reference,serial_from,serial_to,vehicle_number,vehicle_id,vehicle_is_external,issuing_officer,receiving_officer,source_movement_id,return_due_date,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$id, substr((string)($d['movement_date'] ?? date('Y-m-d')), 0, 10), (string)($d['movement_type'] ?? 'Issue'),
+            $d['batch_id'] ?: null, $d['project_id'] ?: null, $d['from_entity'] ?? '', $d['to_entity'] ?? '', $denom, $qty, round($denom * $qty, 2),
+            $d['officer'] ?? '', $d['purpose'] ?? '', $d['reference'] ?? '', $d['serial_from'] ?? '', $d['serial_to'] ?? '',
+            $d['vehicle_number'] ?? '', $d['vehicle_id'] ?: null, (int)($d['vehicle_is_external'] ?? 0), $d['issuing_officer'] ?? '', $d['receiving_officer'] ?? '',
+            $d['source_movement_id'] ?: null, $d['return_due_date'] ?: null, $u['username']]);
+    ok(['id' => $id, 'face_value' => round($denom * $qty, 2)]);
+}
+function api_fuel_movement_update(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
+    if ($id === '') err('id is required');
+    $denom = (float)($d['denomination'] ?? 0); $qty = (int)($d['quantity'] ?? 0);
+    db()->prepare("UPDATE fuel_coupon_movements SET movement_date=?,from_entity=?,to_entity=?,denomination=?,quantity=?,face_value=?,officer=?,purpose=?,reference=?,serial_from=?,serial_to=?,vehicle_number=?,updated_by=?,updated_at=datetime('now') WHERE id=?")
+        ->execute([substr((string)($d['movement_date'] ?? date('Y-m-d')), 0, 10), $d['from_entity'] ?? '', $d['to_entity'] ?? '', $denom, $qty, round($denom * $qty, 2),
+            $d['officer'] ?? '', $d['purpose'] ?? '', $d['reference'] ?? '', $d['serial_from'] ?? '', $d['serial_to'] ?? '', $d['vehicle_number'] ?? '', $u['username'] ?? '', $id]);
+    ok(['id' => $id, 'updated' => true]);
+}
+function api_fuel_movement_receipt(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
+    if ($id === '') err('id is required');
+    db()->prepare("UPDATE fuel_coupon_movements SET receipt_submitted=?, receipt_date=?, updated_at=datetime('now') WHERE id=?")
+        ->execute([(int)($d['receipt_submitted'] ?? 1), substr((string)($d['receipt_date'] ?? date('Y-m-d')), 0, 10), $id]);
+    ok(['id' => $id, 'receipt_submitted' => true]);
+}
+function api_fuel_return_sources(): void {
+    require_auth();
+    // Issued movements not yet fully returned/reversed — the pool a Return can draw from.
+    $rows = db()->query("SELECT id, movement_date, batch_id, denomination, quantity, face_value, to_entity, vehicle_number, serial_from, serial_to
+        FROM fuel_coupon_movements WHERE movement_type IN ('Issue','Lend') AND COALESCE(is_reversed,0)=0 AND COALESCE(is_deleted,0)=0
+        ORDER BY movement_date DESC LIMIT 200")->fetchAll();
+    send($rows);
+}
+function api_fuel_batch_update(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
+    if ($id === '') err('id is required');
+    db()->prepare("UPDATE fuel_coupon_batches SET supplier=?,invoice_number=?,denomination=?,quantity=?,face_value=?,notes=?,serial_from=?,serial_to=?,updated_by=?,updated_at=datetime('now') WHERE id=? AND COALESCE(ledger_posted,0)=0")
+        ->execute([$d['supplier'] ?? '', $d['invoice_number'] ?? '', (float)($d['denomination'] ?? 0), (int)($d['quantity'] ?? 0), round((float)($d['denomination'] ?? 0) * (int)($d['quantity'] ?? 0), 2), $d['notes'] ?? '', $d['serial_from'] ?? '', $d['serial_to'] ?? '', $u['username'] ?? '', $id]);
+    ok(['id' => $id, 'updated' => true, 'note' => 'Posted batches are locked; only un-posted batches update.']);
+}
+
+// ── Petty-cash reconcile (cash count + optional variance posting) and float close. ──
+function api_pc2_reconcile(): void {
+    ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $fid = (string)($d['float_id'] ?? ''); if ($fid === '') err('float_id is required');
+    $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch(); if (!$fl) err('Float not found');
+    $book = round((float)pc_book_balance($fid), 2);
+    $counted = round((float)($d['counted_cash'] ?? 0), 2);
+    $variance = round($counted - $book, 2); // negative = shortage, positive = overage
+    $date = substr((string)($d['date'] ?? date('Y-m-d')), 0, 10); $jvnum = null;
+    $post = !in_array((string)($d['post'] ?? $d['post_variance'] ?? ''), ['', '0', 'false', 'no', 'off'], true);
+    db()->exec("CREATE TABLE IF NOT EXISTS petty_cash_counts(id TEXT PRIMARY KEY, float_id TEXT, count_date TEXT, book_balance REAL, counted_cash REAL, variance REAL, notes TEXT, jv_number TEXT, counted_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    if ($post && abs($variance) >= 0.01) {
+        // shortage: Dr expense / Cr float ; overage: Dr float / Cr income
+        $exp = get_coa(['61900099', '6']); $inc = get_coa(['41000099', '4']);
+        $line = $variance < 0
+            ? [['coa_id' => ($exp['id'] ?? null), 'debit_amount' => abs($variance), 'credit_amount' => 0, 'description' => 'Petty cash shortage — ' . $fl['name']],
+               ['coa_id' => $fl['coa_id'], 'debit_amount' => 0, 'credit_amount' => abs($variance), 'description' => 'Cash short on count']]
+            : [['coa_id' => $fl['coa_id'], 'debit_amount' => $variance, 'credit_amount' => 0, 'description' => 'Cash over on count'],
+               ['coa_id' => ($inc['id'] ?? null), 'debit_amount' => 0, 'credit_amount' => $variance, 'description' => 'Petty cash overage — ' . $fl['name']]];
+        if (!empty($line[0]['coa_id']) && !empty($line[1]['coa_id'])) {
+            try { [$jid, $jvnum] = post_journal($u, 'JV', $date, substr($date, 0, 7), 'Petty cash variance — ' . $fl['name'], $line, 'petty_cash_count', $fid, $fl['unit_id'] ?? null); } catch (Throwable $e) {}
+        }
+    }
+    db()->prepare("INSERT INTO petty_cash_counts(id,float_id,count_date,book_balance,counted_cash,variance,notes,jv_number,counted_by) VALUES(?,?,?,?,?,?,?,?,?)")
+        ->execute([uuid4(), $fid, $date, $book, $counted, $variance, $d['notes'] ?? '', $jvnum, $u['username']]);
+    $msg = abs($variance) < 0.01 ? 'Cash count agrees with the book balance.' : sprintf('%s of GHS %.2f recorded%s.', $variance < 0 ? 'Shortage' : 'Overage', abs($variance), $jvnum ? " and posted ($jvnum)" : '');
+    ok(['float_id' => $fid, 'book_balance' => $book, 'counted_cash' => $counted, 'variance' => $variance, 'jv_number' => $jvnum, 'message' => $msg]);
+}
+function api_pc2_float_close(): void {
+    ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $fid = (string)($d['float_id'] ?? ''); if ($fid === '') err('float_id is required');
+    $reason = trim((string)($d['reason'] ?? '')); if (strlen($reason) < 5) err('A reason of at least 5 characters is required to close a float.');
+    $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch(); if (!$fl) err('Float not found');
+    if ((string)($fl['status'] ?? '') === 'Closed') err('Float is already closed');
+    $book = round((float)pc_book_balance($fid), 2); $jvnum = null;
+    // Return any residual cash to the bank so the imprest account zeroes out.
+    if ($book > 0.01) {
+        $b = operating_bank_coa();
+        if (!empty($b['id'])) {
+            $lines = [['coa_id' => $b['id'], 'debit_amount' => $book, 'credit_amount' => 0, 'description' => 'Residual returned on closing float ' . $fl['name']],
+                      ['coa_id' => $fl['coa_id'], 'debit_amount' => 0, 'credit_amount' => $book, 'description' => 'Close petty cash float ' . $fl['name']]];
+            try { [$jid, $jvnum] = post_journal($u, 'JV', date('Y-m-d'), date('Y-m'), 'Close petty cash float — ' . $fl['name'], $lines, 'petty_cash_close', $fid, $fl['unit_id'] ?? null); } catch (Throwable $e) {}
+        }
+    }
+    db()->prepare("UPDATE petty_cash_floats SET status='Closed' WHERE id=?")->execute([$fid]);
+    ok(['float_id' => $fid, 'status' => 'Closed', 'residual_returned' => $book, 'jv_number' => $jvnum, 'message' => 'Float closed. ' . ($jvnum ? "Residual GHS " . number_format($book, 2) . " returned to bank ($jvnum)." : '')]);
+}
+
+// ── Bulk imports (rows[] or csv_text) — were 404; restore so the upload forms work. ──
+function import_one_employee(array $r, string $by): bool {
+    $name = trim((string)($r['full_name'] ?? ($r['name'] ?? ($r['employee_name'] ?? '')))); if ($name === '') return false;
+    ensure_col('employees', 'unit_id');
+    $uid = null; $uc = (string)($r['unit_code'] ?? ($r['unit'] ?? '')); if ($uc !== '') $uid = org_unit_id_of($uc);
+    $staff = (string)($r['staff_number'] ?? ($r['staff_no'] ?? ''));
+    $empId = (string)($r['employee_id'] ?? ''); if ($empId === '') $empId = $staff !== '' ? $staff : ('EMP-' . substr(uuid4(), 0, 8));
+    // employee_id, division, employment_type, tax_residency are NOT NULL in the seed schema.
+    db()->prepare("INSERT INTO employees(id,employee_id,full_name,staff_number,division,employment_type,tax_residency,basic_salary,ssnit_number,gra_tin,job_title,grade,bank_name,account_number,status,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([uuid4(), $empId, $name, $staff, $r['division'] ?? 'ADMIN', $r['employment_type'] ?? 'Permanent', $r['tax_residency'] ?? 'Resident',
+            (float)($r['basic_salary'] ?? ($r['basic'] ?? 0)), $r['ssnit_number'] ?? '', $r['gra_tin'] ?? ($r['tin'] ?? ''), $r['job_title'] ?? ($r['title'] ?? ''),
+            $r['grade'] ?? '', $r['bank_name'] ?? '', $r['account_number'] ?? '', $r['status'] ?? 'Active', $by, $uid]);
+    return true;
+}
+function import_one_qbudget(array $r, string $by): bool {
+    $dept = trim((string)($r['dept_code'] ?? ($r['department'] ?? ($r['unit'] ?? '')))); if ($dept === '') return false;
+    $uid = org_unit_id_of($dept);
+    db()->prepare("INSERT INTO quarterly_budgets(id,dept_code,academic_year,quarter,coa_id,category,description,q1_amount,q2_amount,q3_amount,q4_amount,currency,approval_status,unit_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([uuid4(), $dept, $r['academic_year'] ?? '', $r['quarter'] ?? '', $r['coa_id'] ?? null, $r['category'] ?? '', $r['description'] ?? '',
+            (float)($r['q1_amount'] ?? 0), (float)($r['q2_amount'] ?? 0), (float)($r['q3_amount'] ?? 0), (float)($r['q4_amount'] ?? 0), $r['currency'] ?? 'GHS', 'Approved', $uid, $by]);
+    return true;
+}
+function api_employee_upload(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $rows = $d['rows'] ?? []; if (!is_array($rows) || !$rows) err('No data rows found in the file');
+    $ins = 0; $errs = [];
+    foreach ($rows as $i => $r) { try { if (import_one_employee((array)$r, $u['username'])) $ins++; else $errs[] = 'Row ' . ($i + 1) . ': missing full_name'; } catch (Throwable $e) { $errs[] = 'Row ' . ($i + 1) . ': ' . $e->getMessage(); } }
+    import_log('employees', (string)($d['filename'] ?? ''), $ins, $errs, $u['username']);
+    ok(['inserted' => $ins, 'errors' => $errs, 'total' => count($rows)]);
+}
+function api_annual_budget_upload(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $rows = $d['rows'] ?? []; if (!is_array($rows) || !$rows) err('No data rows found in the file');
+    $ins = 0; $errs = [];
+    foreach ($rows as $i => $r) { try { if (import_one_qbudget((array)$r, $u['username'])) $ins++; else $errs[] = 'Row ' . ($i + 1) . ': missing dept_code'; } catch (Throwable $e) { $errs[] = 'Row ' . ($i + 1) . ': ' . $e->getMessage(); } }
+    import_log('quarterly_budgets', (string)($d['filename'] ?? ''), $ins, $errs, $u['username']);
+    ok(['inserted' => $ins, 'errors' => $errs, 'total' => count($rows)]);
+}
+function import_log(string $module, string $filename, int $ins, array $errs, string $by): void {
+    try {
+        db()->exec("CREATE TABLE IF NOT EXISTS import_jobs(id TEXT PRIMARY KEY, module TEXT, filename TEXT, total_rows INTEGER, success_rows INTEGER, error_rows INTEGER, notes TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+        db()->prepare("INSERT INTO import_jobs(id,module,filename,total_rows,success_rows,error_rows,notes,created_by) VALUES(?,?,?,?,?,?,?,?)")
+            ->execute([uuid4(), $module, $filename, $ins + count($errs), $ins, count($errs), implode('; ', array_slice($errs, 0, 20)), $by]);
+    } catch (Throwable $e) {}
+}
+function api_import_csv(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $module = strtolower((string)($d['module'] ?? ''));
+    $rows = import_csv_rows($d);
+    if (!$rows) err('No data rows parsed from the file');
+    $map = ['employees' => 'import_one_employee', 'employee' => 'import_one_employee',
+        'quarterly_budgets' => 'import_one_qbudget', 'budgets' => 'import_one_qbudget', 'quarterly' => 'import_one_qbudget'];
+    $fn = $map[$module] ?? null;
+    if (!$fn) err('Unsupported import module "' . $module . '". Supported: employees, quarterly_budgets.');
+    $ins = 0; $errs = [];
+    foreach ($rows as $i => $r) { try { if ($fn((array)$r, $u['username'])) $ins++; else $errs[] = 'Row ' . ($i + 1) . ': missing key field'; } catch (Throwable $e) { $errs[] = 'Row ' . ($i + 1) . ': ' . $e->getMessage(); } }
+    import_log($module, (string)($d['filename'] ?? ''), $ins, $errs, $u['username']);
+    ok(['module' => $module, 'inserted' => $ins, 'errors' => $errs, 'total' => count($rows)]);
+}
+function api_import_jobs(): void {
+    require_auth();
+    db()->exec("CREATE TABLE IF NOT EXISTS import_jobs(id TEXT PRIMARY KEY, module TEXT, filename TEXT, total_rows INTEGER, success_rows INTEGER, error_rows INTEGER, notes TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    send(db()->query("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 50")->fetchAll());
+}
+function api_import_template(): void {
+    require_auth();
+    $m = strtolower((string)($_GET['module'] ?? 'employees'));
+    $tpl = ['employees' => ['full_name', 'staff_number', 'division', 'unit_code', 'employment_type', 'basic_salary', 'ssnit_number', 'gra_tin', 'job_title', 'grade', 'bank_name', 'account_number'],
+        'quarterly_budgets' => ['dept_code', 'academic_year', 'quarter', 'category', 'description', 'q1_amount', 'q2_amount', 'q3_amount', 'q4_amount']];
+    ok(['module' => $m, 'columns' => $tpl[$m] ?? $tpl['employees']]);
+}
+
+// ── Donor / client invoices (own module; create table on demand). Posting to AR is a
+// separate step — these are the invoice records the SPA's invoice view needs. ──
+function ensure_invoice_tables(): void {
+    db()->exec("CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY, invoice_no TEXT, invoice_type TEXT, project_id TEXT, status TEXT, client_name TEXT, client_email TEXT, client_contact TEXT, client_reference TEXT, client_address TEXT, contract_no TEXT, po_no TEXT, invoice_date TEXT, due_date TEXT, service_start TEXT, service_end TEXT, currency TEXT, fx_rate REAL, tax_rate REAL, discount_fcy REAL, bank_account_id TEXT, approved_by TEXT, payment_terms TEXT, payment_instructions TEXT, notes TEXT, total_fcy REAL, total_ghs REAL, unit_id TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    db()->exec("CREATE TABLE IF NOT EXISTS invoice_lines(id TEXT PRIMARY KEY, invoice_id TEXT, line_no INTEGER, description TEXT, quantity REAL, unit TEXT, rate_fcy REAL, amount_fcy REAL)");
+}
+function api_invoices_list(): void {
+    ensure_invoice_tables(); $u = require_auth();
+    [$sw, $sp] = unit_scope_sql($u, 'i', $_GET['unit'] ?? null);
+    $st = db()->prepare("SELECT i.*, p.project_code FROM invoices i LEFT JOIN projects p ON p.id=i.project_id WHERE 1=1$sw ORDER BY i.created_at DESC"); $st->execute($sp);
+    $rows = $st->fetchAll();
+    foreach ($rows as &$r) { $l = db()->prepare("SELECT * FROM invoice_lines WHERE invoice_id=? ORDER BY line_no"); $l->execute([$r['id']]); $r['lines'] = $l->fetchAll(); }
+    unset($r);
+    send($rows);
+}
+function api_invoice_save(): void {
+    ensure_invoice_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    if (empty($d['client_name'])) err('client_name is required');
+    $lines = is_array($d['lines'] ?? null) ? $d['lines'] : [];
+    $fx = (float)($d['fx_rate'] ?? 1); $taxRate = (float)($d['tax_rate'] ?? 0); $disc = (float)($d['discount_fcy'] ?? 0);
+    $sub = 0.0; foreach ($lines as $ln) { $sub += round((float)($ln['amount_fcy'] ?? ((float)($ln['quantity'] ?? 0) * (float)($ln['rate_fcy'] ?? 0))), 2); }
+    $totFcy = round(($sub - $disc) * (1 + $taxRate / 100), 2); $totGhs = round($totFcy * ($fx ?: 1), 2);
+    $unit = resolve_write_unit($u, $d);
+    $id = (string)($d['id'] ?? '');
+    if ($id !== '') { $e = db()->prepare('SELECT id FROM invoices WHERE id=?'); $e->execute([$id]); if (!$e->fetchColumn()) $id = ''; }
+    if ($id === '') { $id = uuid4(); $no = (string)($d['invoice_no'] ?? '') ?: seq_code('invoices', 'invoice_no', 'INV-', 4); }
+    else { $no = (string)($d['invoice_no'] ?? '') ?: (db()->query("SELECT invoice_no FROM invoices WHERE id=" . db()->quote($id))->fetchColumn() ?: 'INV'); db()->prepare('DELETE FROM invoice_lines WHERE invoice_id=?')->execute([$id]); db()->prepare('DELETE FROM invoices WHERE id=?')->execute([$id]); }
+    db()->prepare("INSERT INTO invoices(id,invoice_no,invoice_type,project_id,status,client_name,client_email,client_contact,client_reference,client_address,contract_no,po_no,invoice_date,due_date,service_start,service_end,currency,fx_rate,tax_rate,discount_fcy,bank_account_id,approved_by,payment_terms,payment_instructions,notes,total_fcy,total_ghs,unit_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$id, $no, $d['invoice_type'] ?? 'Donor Project', $d['project_id'] ?: null, $d['status'] ?? 'Draft', $d['client_name'], $d['client_email'] ?? '', $d['client_contact'] ?? '', $d['client_reference'] ?? '', $d['client_address'] ?? '', $d['contract_no'] ?? '', $d['po_no'] ?? '', $d['invoice_date'] ?? date('Y-m-d'), $d['due_date'] ?? '', $d['service_start'] ?? '', $d['service_end'] ?? '', $d['currency'] ?? 'GHS', $fx, $taxRate, $disc, $d['bank_account_id'] ?: null, $d['approved_by'] ?? '', $d['payment_terms'] ?? '', $d['payment_instructions'] ?? '', $d['notes'] ?? '', $totFcy, $totGhs, $unit, $u['username']]);
+    $n = 0; $li = db()->prepare("INSERT INTO invoice_lines(id,invoice_id,line_no,description,quantity,unit,rate_fcy,amount_fcy) VALUES(?,?,?,?,?,?,?,?)");
+    foreach ($lines as $ln) { $n++; $li->execute([uuid4(), $id, $n, $ln['description'] ?? '', (float)($ln['quantity'] ?? 0), $ln['unit'] ?? 'Each', (float)($ln['rate_fcy'] ?? 0), round((float)($ln['amount_fcy'] ?? ((float)($ln['quantity'] ?? 0) * (float)($ln['rate_fcy'] ?? 0))), 2)]); }
+    ok(['id' => $id, 'invoice_no' => $no, 'total_ghs' => $totGhs]);
+}
+function api_invoice_html(): void {
+    ensure_invoice_tables(); require_auth();
+    $id = (string)($_GET['id'] ?? ''); if ($id === '') { http_response_code(400); echo 'id required'; exit; }
+    $iv = db()->prepare("SELECT * FROM invoices WHERE id=?"); $iv->execute([$id]); $i = $iv->fetch();
+    if (!$i) { http_response_code(404); echo 'Invoice not found'; exit; }
+    $ls = db()->prepare("SELECT * FROM invoice_lines WHERE invoice_id=? ORDER BY line_no"); $ls->execute([$id]);
+    $rows = '';
+    foreach ($ls->fetchAll() as $l) $rows .= '<tr><td>' . htmlspecialchars((string)$l['description']) . '</td><td style="text-align:right">' . (float)$l['quantity'] . '</td><td style="text-align:right">' . number_format((float)$l['rate_fcy'], 2) . '</td><td style="text-align:right">' . number_format((float)$l['amount_fcy'], 2) . '</td></tr>';
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html><head><meta charset="utf-8"><title>' . htmlspecialchars((string)$i['invoice_no']) . '</title><style>body{font-family:system-ui,Arial;margin:40px;color:#0f172a}h1{color:#0060A9}table{width:100%;border-collapse:collapse;margin-top:16px}th,td{border-bottom:1px solid #e2e8f0;padding:8px;text-align:left}.tot{font-weight:700;font-size:18px;text-align:right;margin-top:14px}</style></head><body>'
+        . '<h1>INVOICE ' . htmlspecialchars((string)$i['invoice_no']) . '</h1>'
+        . '<div>University of Cape Coast — Finance Directorate</div>'
+        . '<p><b>To:</b> ' . htmlspecialchars((string)$i['client_name']) . '<br>' . nl2br(htmlspecialchars((string)$i['client_address'])) . '</p>'
+        . '<p><b>Date:</b> ' . htmlspecialchars((string)$i['invoice_date']) . ' &nbsp; <b>Due:</b> ' . htmlspecialchars((string)$i['due_date']) . ' &nbsp; <b>Currency:</b> ' . htmlspecialchars((string)$i['currency']) . '</p>'
+        . '<table><thead><tr><th>Description</th><th style="text-align:right">Qty</th><th style="text-align:right">Rate</th><th style="text-align:right">Amount</th></tr></thead><tbody>' . $rows . '</tbody></table>'
+        . '<div class="tot">Total: ' . htmlspecialchars((string)$i['currency']) . ' ' . number_format((float)$i['total_fcy'], 2) . ' &nbsp;(GHS ' . number_format((float)$i['total_ghs'], 2) . ')</div>'
+        . '<p style="margin-top:24px;color:#64748b">' . nl2br(htmlspecialchars((string)$i['payment_terms'])) . '</p></body></html>';
+    exit;
+}
+
 // The seed's users table carries a column-level CHECK limiting role to the three
 // operational roles. Widen it once (preserving all columns/data) so read-only roles
 // like Auditor can be provisioned. Idempotent: skips once 'Auditor' is in the DDL.
@@ -5628,6 +5848,21 @@ try {
     if ($path === '/api/withholding-payables/settle' && $method === 'POST') api_withholding_settle();
     if ($path === '/api/fuel-coupons/batch' && $method === 'POST') api_fuel_batch_save();
     if ($path === '/api/fuel-coupons/batch/post' && $method === 'POST') api_fuel_batch_post();
+    if ($path === '/api/fuel-coupons/batch/update' && $method === 'POST') api_fuel_batch_update();
+    if ($path === '/api/fuel-coupons/movement' && $method === 'POST') api_fuel_movement_save();
+    if ($path === '/api/fuel-coupons/movement/update' && $method === 'POST') api_fuel_movement_update();
+    if ($path === '/api/fuel-coupons/receipt' && $method === 'POST') api_fuel_movement_receipt();
+    if ($path === '/api/fuel-coupons/return-source' && $method === 'GET') api_fuel_return_sources();
+    if ($path === '/api/petty-cash2/reconcile' && $method === 'POST') api_pc2_reconcile();
+    if ($path === '/api/petty-cash2/float/close' && $method === 'POST') api_pc2_float_close();
+    if ($path === '/api/employee-upload' && $method === 'POST') api_employee_upload();
+    if (($path === '/api/annual-budget-upload' || $path === '/api/budget-upload') && $method === 'POST') api_annual_budget_upload();
+    if ($path === '/api/import/csv' && $method === 'POST') api_import_csv();
+    if ($path === '/api/import/jobs' && $method === 'GET') api_import_jobs();
+    if ($path === '/api/import/template' && $method === 'GET') api_import_template();
+    if ($path === '/api/invoices' && $method === 'GET') api_invoices_list();
+    if ($path === '/api/invoices' && $method === 'POST') api_invoice_save();
+    if ($path === '/api/invoices/html' && $method === 'GET') api_invoice_html();
 
     // Role-guard demonstration (Phase 1 acceptance: read-only roles cannot write).
     if ($path === '/api/_phase1_write_probe' && $method === 'POST') {
