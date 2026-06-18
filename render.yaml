@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: UCC-FMS
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --preload
+    healthCheckPath: /healthz
+    envVars:
+      - key: RENDER_DATA_DIR
+        value: /var/data
+      # Set CRON_TOKEN (a long random string) in the dashboard to enable the
+      # /api/cron/backup endpoint used by the daily-backup cron service below.
+      - key: CRON_TOKEN
+        sync: false
+      # Off-site backup target (S3-compatible: AWS S3 / Cloudflare R2 / Backblaze B2 /
+      # Wasabi / DO Spaces). Set in the dashboard to ship each backup off the disk.
+      - key: BACKUP_S3_ENDPOINT
+        sync: false
+      - key: BACKUP_S3_REGION
+        sync: false
+      - key: BACKUP_S3_BUCKET
+        sync: false
+      - key: BACKUP_S3_ACCESS_KEY
+        sync: false
+      - key: BACKUP_S3_SECRET_KEY
+        sync: false
+    disk:
+      name: ucc-fms-data
+      mountPath: /var/data
+      sizeGB: 5
+
+  # Daily WAL-consistent backup to the persistent disk (/var/data/backups).
+  # Set APP_URL (the web service's public URL) and the SAME CRON_TOKEN in the dashboard.
+  - type: cron
+    name: UCC-FMS-daily-backup
+    runtime: python
+    schedule: "0 2 * * *"
+    buildCommand: "echo no build needed"
+    startCommand: python -c "import os,urllib.request; u=os.environ['APP_URL'].rstrip('/')+'/api/cron/backup'; req=urllib.request.Request(u, headers={'X-Cron-Token':os.environ['CRON_TOKEN']}); print(urllib.request.urlopen(req, timeout=120).read().decode())"
+    envVars:
+      - key: APP_URL
+        sync: false
+      - key: CRON_TOKEN
+        sync: false

@@ -1,0 +1,29 @@
+name: smoke-test
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Boot app (gunicorn)
+        run: |
+          gunicorn app:app --bind 127.0.0.1:5000 --workers 1 --timeout 120 --preload &
+          echo $! > /tmp/app.pid
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:5000/healthz >/dev/null 2>&1; then echo "app up"; break; fi
+            sleep 1
+          done
+      - name: Run regression smoke test
+        run: python smoke_test.py --base http://127.0.0.1:5000 --user admin --pass 'UCC@2024' --period 2026-06 --date 2026-06-15
+      - name: Stop app
+        if: always()
+        run: kill "$(cat /tmp/app.pid)" 2>/dev/null || true

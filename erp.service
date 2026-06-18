@@ -1,0 +1,18 @@
+# systemd unit (UCC-FMS) — for a UCC VM deployment (Option B in the directorate brief)
+# install: sudo cp erp.service /etc/systemd/system/ucc-fms.service && sudo systemctl enable --now ucc-fms
+[Unit]
+Description=University of Cape Coast Financial Management System
+After=network.target
+
+[Service]
+Type=simple
+User=erp
+WorkingDirectory=/opt/ucc-fms
+Environment=RENDER_DATA_DIR=/var/lib/ucc-fms
+Environment=PORT=8000
+ExecStart=/usr/bin/python3 -m gunicorn app:app --bind 127.0.0.1:8000 --workers 1 --threads 8 --worker-class gthread --timeout 120 --preload
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

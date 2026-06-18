@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UCC-FMS — Monthly Financial Cycle Runbook</title>
+<style>
+  :root{--navy:#0f2742;--navy2:#16385c;--teal:#0d9488;--teal2:#0f766e;--ink:#1f2937;--mut:#5b6b7f;--line:#dbe3ec;--amber:#b45309;--amberbg:#fef3c7;--green:#047857;--greenbg:#ecfdf5;--blue:#1e40af;--bluebg:#eff6ff;}
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#eef2f6;color:var(--ink);font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  .page{width:210mm;min-height:297mm;margin:10px auto;background:#fff;padding:14mm 14mm 10mm;box-shadow:0 6px 24px rgba(15,39,66,.14);}
+  header{display:flex;align-items:center;gap:14px;border-bottom:3px solid var(--teal);padding-bottom:10px;margin-bottom:12px;}
+  .badge{width:52px;height:52px;border-radius:12px;background:linear-gradient(135deg,var(--navy),var(--navy2));color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;letter-spacing:.5px;flex:0 0 auto;}
+  .h-t{font-size:19px;font-weight:800;color:var(--navy);line-height:1.15}
+  .h-s{font-size:12px;color:var(--mut);margin-top:2px}
+  .h-meta{margin-left:auto;text-align:right;font-size:11px;color:var(--mut)}
+  h2{font-size:12.5px;font-weight:800;color:#fff;background:var(--navy);margin:14px 0 7px;padding:5px 10px;border-radius:6px;letter-spacing:.3px;text-transform:uppercase;}
+  h2.teal{background:var(--teal2)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:7px 16px}
+  ol,ul{margin:4px 0 0;padding-left:18px}
+  li{margin:3px 0}
+  .step{display:flex;gap:8px;align-items:flex-start;margin:4px 0}
+  .num{flex:0 0 auto;width:18px;height:18px;border-radius:50%;background:var(--teal);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;margin-top:1px}
+  .chk{flex:0 0 auto;width:13px;height:13px;border:1.5px solid var(--navy);border-radius:3px;margin-top:2px}
+  .nav{color:var(--blue);font-weight:700}
+  .btn{display:inline-block;background:var(--teal);color:#fff;border-radius:4px;padding:0 6px;font-size:11px;font-weight:700}
+  .tip{font-size:11px;color:var(--mut)}
+  .callout{border-radius:8px;padding:8px 11px;margin:8px 0;font-size:12px}
+  .must{background:var(--amberbg);border:1px solid #f6cf6b;color:#7c4a06}
+  .must b{color:var(--amber)}
+  .controls{background:var(--greenbg);border:1px solid #a7e3c8}
+  .controls .row{display:flex;gap:10px;align-items:center;margin:4px 0;font-weight:700;color:var(--green)}
+  .signoff{margin-top:12px;border:1px dashed var(--line);border-radius:8px;padding:10px 12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:11px;color:var(--mut)}
+  .signoff .ln{border-bottom:1px solid #9fb0c2;height:26px;margin-bottom:3px}
+  footer{margin-top:12px;border-top:1px solid var(--line);padding-top:7px;font-size:10.5px;color:var(--mut);display:flex;justify-content:space-between}
+  footer b{color:var(--navy)}
+  .legend{font-size:10.5px;color:var(--mut);margin:2px 0 0}
+  @media print{html,body{background:#fff}.page{margin:0;box-shadow:none;width:auto;min-height:auto;padding:12mm}@page{size:A4;margin:10mm}}
+</style></head>
+<body><div class="page">
+  <header>
+    <div class="badge">UCC</div>
+    <div>
+      <div class="h-t">Monthly Financial Cycle &mdash; Runbook</div>
+      <div class="h-s">University of Cape Coast &middot; UCC-FMS &middot; Directorate of Finance, UCC</div>
+    </div>
+    <div class="h-meta">Period: <b>____________</b><br>UCC uses MONTHLY periods (e.g. 2026-06)</div>
+  </header>
+
+  <div class="legend">Legend: <span class="nav">Blue</span> = menu location &middot; <span class="btn">Green</span> = button to click &middot; &#9744; = tick when done.</div>
+
+  <h2 class="teal">A. During the month &mdash; record &amp; POST as transactions happen</h2>
+  <div class="grid">
+    <div>
+      <div class="step"><div class="chk"></div><div><b>Money received</b> &rarr; <span class="nav">Receipts / RV</span> &rarr; record &rarr; <span class="btn">Post</span><div class="tip">Not in the ledger until you Post it.</div></div></div>
+      <div class="step"><div class="chk"></div><div><b>Payments made</b> &rarr; <span class="nav">Payments / PV</span> &rarr; record &rarr; choose <span class="btn">Post now</span> on the save prompt<div class="tip">Imprest, assets, advances &amp; project payments all go here, against the official UCC COA.</div></div></div>
+    </div>
+    <div>
+      <div class="step"><div class="chk"></div><div><b>Clear all drafts</b> &rarr; on <span class="nav">Payments / PV</span>, if the amber <b>Draft</b> badge shows, click <span class="btn">&#9889; Post all drafts</span><div class="tip">A Draft PV is saved but NOT in any report.</div></div></div>
+      <div class="step"><div class="chk"></div><div><b>Commitments</b> (POs/contracts) &rarr; <span class="nav">Commitments</span> for budget control before spending.</div></div>
+    </div>
+  </div>
+
+  <h2>B. Statutory &amp; periodic (each month)</h2>
+  <div class="grid">
+    <div>
+      <div class="step"><div class="chk"></div><div><b>Payroll</b> &rarr; <span class="nav">Payroll</span> &rarr; <span class="btn">Run</span> &rarr; <span class="btn">Approve</span><div class="tip">Approve posts the salary journal (PAYE, SSNIT, net pay) to the ledger.</div></div></div>
+      <div class="step"><div class="chk"></div><div><b>Depreciation</b> &rarr; <span class="nav">Asset Register</span> &rarr; <span class="btn">Run depreciation</span> once for the month.</div></div>
+    </div>
+    <div>
+      <div class="step"><div class="chk"></div><div><b>Remit withholdings</b> &rarr; <span class="nav">Withholding Payables</span> &rarr; settle WHT / VAT / UCF to GRA when paid.</div></div>
+      <div class="step"><div class="chk"></div><div><b>Fuel</b> &rarr; <span class="nav">Fuel &amp; Vehicle</span> &rarr; reconcile coupons issued vs stock; post procurement.</div></div>
+    </div>
+  </div>
+
+  <h2 class="teal">C. Month-end close &mdash; do in this order</h2>
+  <div class="grid">
+    <div>
+      <div class="step"><div class="num">1</div><div><b>Bank Reconciliation</b> &rarr; <span class="nav">Bank Reconciliation</span> &mdash; match each statement line to the ledger.</div></div>
+      <div class="step"><div class="num">2</div><div><b>Trial Balance</b> &rarr; <span class="nav">Reports &rarr; Trial Balance</span> &mdash; confirm total Debit = total Credit.</div></div>
+      <div class="step"><div class="num">3</div><div><b>Financial statements</b> &rarr; generate <span class="nav">SFP</span>, <span class="nav">Income &amp; Expenditure</span>, <span class="nav">Cash Flow</span>, <span class="nav">Changes in Net Assets</span>.</div></div>
+    </div>
+    <div>
+      <div class="step"><div class="num">4</div><div><b>Budget Variance</b> &rarr; <span class="nav">Reports &rarr; Budget Variance</span> &mdash; review actual vs budget; explain overspends.</div></div>
+      <div class="step"><div class="num">5</div><div><b>Period Close</b> &rarr; <span class="nav">Period Close</span> &mdash; lock the month &amp; sign off so no further posting changes it.</div></div>
+      <div class="step"><div class="num">6</div><div><b>Back up</b> &rarr; <span class="nav">Backups</span> &rarr; <span class="btn">Download Backup</span> &mdash; keep an off-site copy.</div></div>
+    </div>
+  </div>
+
+  <div class="callout controls">
+    <div style="font-weight:800;color:var(--green);margin-bottom:3px">THREE CONTROLS THAT MUST PASS BEFORE YOU CLOSE</div>
+    <div class="row"><div class="chk"></div> No PVs left in <b>Draft</b> status</div>
+    <div class="row"><div class="chk"></div> <b>Trial Balance</b> balances (Debit = Credit)</div>
+    <div class="row"><div class="chk"></div> <b>SFP presentation difference = 0</b> (Assets = Liabilities + Net Assets), and Cash Flow closing = SFP cash</div>
+  </div>
+
+  <h2>D. Year-end (once per financial year, after the last month is closed)</h2>
+  <ul>
+    <li><b>Year-End Close</b> &rarr; <span class="nav">Year-End Close</span> &mdash; posts the closing journals that carry the year's surplus/deficit into <b>Accumulated Fund</b>. Income &amp; expense reset to zero for the new year; balance-sheet balances carry forward.</li>
+  </ul>
+
+  <div class="must callout"><b>If a number looks wrong:</b> never edit a posted entry by hand. Open it &rarr; <b>Admin Edit</b> &rarr; the system posts a reversal + a corrected entry (full audit trail). The reversal line in the ledger is normal &mdash; the net effect is only your correction.</div>
+
+  <div class="signoff">
+    <div>Prepared by<div class="ln"></div>Name &amp; signature</div>
+    <div>Reviewed by<div class="ln"></div>Name &amp; signature</div>
+    <div>Date closed<div class="ln"></div>DD / MM / YYYY</div>
+  </div>
+
+  <footer>
+    <span>UCC-FMS Monthly Runbook &middot; keep with the period close file</span>
+    <span>Powered by <b>Enoch Enchill Essoun</b> &middot; Directorate of Finance, UCC</span>
+  </footer>
+</div></body></html>
