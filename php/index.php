@@ -3307,26 +3307,35 @@ function org_subtree_ids(string $code): array {
     return $ids;
 }
 function resolve_read_scope(array $u, ?string $node): ?array {
-    // null = unrestricted (whole university); array = the unit_ids the viewer may see.
-    if ($node) {
-        // Accept either an org-unit code or an id; normalise to a code for the subtree walk.
-        $chk = db()->prepare('SELECT code FROM org_units WHERE code=? OR id=? LIMIT 1'); $chk->execute([$node, $node]);
-        $code = $chk->fetchColumn() ?: $node;
-        $ids = org_subtree_ids($code); return $ids ?: ['__none__'];
+    // Returns null = unrestricted (whole university); array = the unit_ids the viewer may
+    // see. SECURITY: the caller's BASE scope is computed first and a requested ?unit= node
+    // is INTERSECTED with it — a unit-scoped user can never widen their view by passing
+    // another unit's code/id. Only Admin / university scope may drill to an arbitrary node.
+    // Admin always sees the whole institution; everyone else fails CLOSED on error.
+    $base = null; // null = unrestricted
+    if (($u['role'] ?? '') !== 'Admin') {
+        try {
+            $r = db()->prepare('SELECT home_unit_id, scope FROM users WHERE username=?'); $r->execute([$u['username'] ?? '']); $row = $r->fetch();
+        } catch (Throwable $e) { return ['__none__']; }
+        if (!$row) return ['__none__'];
+        $scope = $row['scope'] ?? null; $home = $row['home_unit_id'] ?? null;
+        if ($scope === 'university') {
+            $base = null;
+        } elseif (!$home) {
+            return ['__none__'];
+        } else {
+            $hc = db()->prepare('SELECT code FROM org_units WHERE id=?'); $hc->execute([$home]); $hcode = $hc->fetchColumn();
+            $base = ($scope === 'subtree' && $hcode) ? org_subtree_ids($hcode) : [$home];
+        }
     }
-    // Admin always sees the whole institution. For everyone else, fail CLOSED on any
-    // lookup error or missing record (no silent unrestricted access).
-    if (($u['role'] ?? '') === 'Admin') return null;
-    try {
-        $r = db()->prepare('SELECT home_unit_id, scope FROM users WHERE username=?'); $r->execute([$u['username'] ?? '']); $row = $r->fetch();
-    } catch (Throwable $e) { return ['__none__']; }
-    if (!$row) return ['__none__'];
-    $scope = $row['scope'] ?? null; $home = $row['home_unit_id'] ?? null;
-    if ($scope === 'university') return null;
-    if (!$home) return ['__none__'];
-    $hc = db()->prepare('SELECT code FROM org_units WHERE id=?'); $hc->execute([$home]); $hcode = $hc->fetchColumn();
-    if ($scope === 'subtree' && $hcode) return org_subtree_ids($hcode);
-    return [$home]; // own_unit
+    if (!$node) return $base;
+    // Explicit node: resolve its subtree, then constrain to the caller's base scope.
+    $chk = db()->prepare('SELECT code FROM org_units WHERE code=? OR id=? LIMIT 1'); $chk->execute([$node, $node]);
+    $code = $chk->fetchColumn() ?: $node;
+    $req = org_subtree_ids($code); if (!$req) return ['__none__'];
+    if ($base === null) return $req;                                   // Admin/university: any node
+    $inter = array_values(array_intersect($req, $base));
+    return $inter ?: ['__none__'];                                     // scoped user: only within own scope
 }
 function gl_scope_sql(array $u, ?string $node): array {
     $scope = resolve_read_scope($u, $node);
@@ -3925,30 +3934,44 @@ function api_payroll_approve(): void {
     $id_paye = $pcoa('21100017', '2010'); $id_ssn = $pcoa('21100015', '2011');
     $id_t2 = $pcoa('21100021', '2012'); $id_ded = $pcoa('21100021', '2038'); $id_net = $pcoa('21200005', '21100021', '2036');
     if (!$id_sal || !$id_paye || !$id_ssn || !$id_net) err('Payroll GL accounts missing from chart of accounts');
-    // Salary + employer-SSNIT expense (Dr) split BY UNIT so each school/centre carries its
-    // own staff cost in unit-scoped reports (was posted entirely to the Central root). The
-    // liability/net-pay credits stay at institution level. Credits are balanced to the
-    // actual posted debit total (absorbs any per-unit rounding).
-    $lines = []; $dtot = 0.0;
-    $bu = db()->prepare("SELECT unit_id, COALESCE(SUM(gross_pay),0) AS sal, COALESCE(SUM(employer_tier1),0)+COALESCE(SUM(employer_tier2),0) AS essx FROM payroll_register WHERE payroll_month=? AND status='Approved' GROUP BY unit_id");
+    // Post the payroll JV as per-unit BALANCED blocks: for each unit, Dr salary +
+    // employer-SSNIT / Cr PAYE + SSNIT + Tier2 + deductions + net pay, every leg stamped
+    // to that unit. Net pay = the unit's cost less its other credits, so each unit's slice
+    // nets to zero -> per-unit SFP/TB tie, not just the institution total (was: debits
+    // per-unit but all credits at the Central root, which unbalanced every unit's statement).
+    $lines = [];
+    $bu = db()->prepare("SELECT unit_id,
+        COALESCE(SUM(gross_pay),0) sal, COALESCE(SUM(employer_tier1),0)+COALESCE(SUM(employer_tier2),0) essx,
+        COALESCE(SUM(paye),0) paye, COALESCE(SUM(employee_tier1),0)+COALESCE(SUM(employer_tier1),0) ssn,
+        COALESCE(SUM(employee_tier2),0)+COALESCE(SUM(employer_tier2),0) t2,
+        COALESCE(SUM(loan_deduction),0)+COALESCE(SUM(union_deduction),0)+COALESCE(SUM(other_deduction),0) ded
+        FROM payroll_register WHERE payroll_month=? AND status='Approved' GROUP BY unit_id");
     $bu->execute([$month]);
-    foreach ($bu->fetchAll() as $ur) {
-        $usal = round((float)$ur['sal'], 2); $uessx = round((float)$ur['essx'], 2); $uu = $ur['unit_id'] ?: null;
-        if ($usal != 0.0) { $lines[] = ['coa_id' => $id_sal, 'debit_amount' => $usal, 'credit_amount' => 0, 'description' => "Salaries & wages $month", 'unit_id' => $uu]; $dtot += $usal; }
-        if ($uessx != 0.0 && $id_ssx) { $lines[] = ['coa_id' => $id_ssx, 'debit_amount' => $uessx, 'credit_amount' => 0, 'description' => "Employer SSNIT $month", 'unit_id' => $uu]; $dtot += $uessx; }
+    foreach ($bu->fetchAll() as $r2) {
+        $uu = $r2['unit_id'] ?: null;
+        $usal = round((float)$r2['sal'], 2); $uessx = round((float)$r2['essx'], 2);
+        $upaye = round((float)$r2['paye'], 2); $ussn = round((float)$r2['ssn'], 2);
+        $ut2 = round((float)$r2['t2'], 2); $uded = round((float)$r2['ded'], 2);
+        $ucost = round($usal + $uessx, 2);
+        if ($ucost <= 0) continue;
+        $unet = round($ucost - ($upaye + $ussn + $ut2 + $uded), 2); // balances this unit's block
+        if ($usal != 0.0) $lines[] = ['coa_id' => $id_sal, 'debit_amount' => $usal, 'credit_amount' => 0, 'description' => "Salaries & wages $month", 'unit_id' => $uu];
+        if ($uessx != 0.0 && $id_ssx) $lines[] = ['coa_id' => $id_ssx, 'debit_amount' => $uessx, 'credit_amount' => 0, 'description' => "Employer SSNIT $month", 'unit_id' => $uu];
+        if ($upaye > 0) $lines[] = ['coa_id' => $id_paye, 'debit_amount' => 0, 'credit_amount' => $upaye, 'description' => 'PAYE payable (GRA)', 'unit_id' => $uu];
+        if ($ussn > 0) $lines[] = ['coa_id' => $id_ssn, 'debit_amount' => 0, 'credit_amount' => $ussn, 'description' => 'SSNIT Tier 1 payable', 'unit_id' => $uu];
+        if ($ut2 > 0) $lines[] = ['coa_id' => $id_t2, 'debit_amount' => 0, 'credit_amount' => $ut2, 'description' => 'Tier 2 pension payable', 'unit_id' => $uu];
+        if ($uded > 0) $lines[] = ['coa_id' => $id_ded, 'debit_amount' => 0, 'credit_amount' => $uded, 'description' => 'Staff deductions payable', 'unit_id' => $uu];
+        if ($unet != 0.0) $lines[] = ['coa_id' => $id_net, 'debit_amount' => 0, 'credit_amount' => $unet, 'description' => 'Net salary payable', 'unit_id' => $uu];
     }
-    if (!$lines) { // no per-unit data — fall back to the single aggregate debit lines
+    if (!$lines) { // fallback: single aggregate balanced block (no per-unit register data)
         $lines[] = ['coa_id' => $id_sal, 'debit_amount' => $gross_basic, 'credit_amount' => 0, 'description' => "Salaries & wages $month"];
         if ($empr_ssnit > 0 && $id_ssx) $lines[] = ['coa_id' => $id_ssx, 'debit_amount' => $empr_ssnit, 'credit_amount' => 0, 'description' => "Employer SSNIT $month"];
-        $dtot = round($gross_basic + $empr_ssnit, 2);
+        if ($paye > 0) $lines[] = ['coa_id' => $id_paye, 'debit_amount' => 0, 'credit_amount' => $paye, 'description' => 'PAYE payable (GRA)'];
+        if ($ssnit > 0) $lines[] = ['coa_id' => $id_ssn, 'debit_amount' => 0, 'credit_amount' => $ssnit, 'description' => 'SSNIT Tier 1 payable'];
+        if ($tier2 > 0) $lines[] = ['coa_id' => $id_t2, 'debit_amount' => 0, 'credit_amount' => $tier2, 'description' => 'Tier 2 pension payable'];
+        if ($ded > 0) $lines[] = ['coa_id' => $id_ded, 'debit_amount' => 0, 'credit_amount' => $ded, 'description' => 'Staff deductions payable'];
+        $lines[] = ['coa_id' => $id_net, 'debit_amount' => 0, 'credit_amount' => $net, 'description' => 'Net salary payable'];
     }
-    $cost = round($dtot, 2);                                   // posted debit total is authoritative
-    $net = round($cost - round($paye + $ssnit + $tier2 + $ded, 2), 2); // net pay balances the JV
-    if ($paye > 0) $lines[] = ['coa_id' => $id_paye, 'debit_amount' => 0, 'credit_amount' => $paye, 'description' => 'PAYE payable (GRA)'];
-    if ($ssnit > 0) $lines[] = ['coa_id' => $id_ssn, 'debit_amount' => 0, 'credit_amount' => $ssnit, 'description' => 'SSNIT Tier 1 payable'];
-    if ($tier2 > 0) $lines[] = ['coa_id' => $id_t2, 'debit_amount' => 0, 'credit_amount' => $tier2, 'description' => 'Tier 2 pension payable'];
-    if ($ded > 0) $lines[] = ['coa_id' => $id_ded, 'debit_amount' => 0, 'credit_amount' => $ded, 'description' => 'Staff deductions payable'];
-    $lines[] = ['coa_id' => $id_net, 'debit_amount' => 0, 'credit_amount' => $net, 'description' => 'Net salary payable'];
     $jvdate = (strlen($month) === 7 ? $month : substr($month, 0, 7)) . '-01';
     try { [$jid, $jvnum] = post_journal($u, 'JV', $jvdate, substr($jvdate, 0, 7), "Payroll $month", $lines, 'payroll', $month, resolve_write_unit($u, $d)); }
     catch (Throwable $e) { err('Payroll GL posting failed: ' . $e->getMessage()); }
@@ -4196,7 +4219,7 @@ function api_fuel_movement_save(): void {
     ok(['id' => $id, 'face_value' => round($denom * $qty, 2)]);
 }
 function api_fuel_movement_update(): void {
-    require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
+    $u = require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
     if ($id === '') err('id is required');
     $denom = (float)($d['denomination'] ?? 0); $qty = (int)($d['quantity'] ?? 0);
     db()->prepare("UPDATE fuel_coupon_movements SET movement_date=?,from_entity=?,to_entity=?,denomination=?,quantity=?,face_value=?,officer=?,purpose=?,reference=?,serial_from=?,serial_to=?,vehicle_number=?,updated_by=?,updated_at=datetime('now') WHERE id=?")
@@ -4220,7 +4243,7 @@ function api_fuel_return_sources(): void {
     send($rows);
 }
 function api_fuel_batch_update(): void {
-    require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
+    $u = require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
     if ($id === '') err('id is required');
     db()->prepare("UPDATE fuel_coupon_batches SET supplier=?,invoice_number=?,denomination=?,quantity=?,face_value=?,notes=?,serial_from=?,serial_to=?,updated_by=?,updated_at=datetime('now') WHERE id=? AND COALESCE(ledger_posted,0)=0")
         ->execute([$d['supplier'] ?? '', $d['invoice_number'] ?? '', (float)($d['denomination'] ?? 0), (int)($d['quantity'] ?? 0), round((float)($d['denomination'] ?? 0) * (int)($d['quantity'] ?? 0), 2), $d['notes'] ?? '', $d['serial_from'] ?? '', $d['serial_to'] ?? '', $u['username'] ?? '', $id]);

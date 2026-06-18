@@ -141,6 +141,16 @@ check('consolidation ties (all = CANS + CHLS = 1,050,000)',
 check('scoped user sees only own subtree (== admin?unit=CANS, excludes CHLS)',
       d_cans_user == 750000.0, 'delta scoped-user=%.0f (expect 750000)' % d_cans_user)
 
+# 4b. Horizontal bypass guard: a scoped user passing ?unit=<sibling> must STILL see
+#     nothing — the requested node is intersected with the caller's own scope, so it
+#     cannot widen their view by naming another unit (regression guard for the scope
+#     bypass the security review caught).
+bypass_chls, _ = tb_debit(cans, 'CHLS')
+bypass_ucc, _ = tb_debit(cans, 'UCC')
+check('scoped user CANNOT bypass scope via ?unit=<other node>',
+      bypass_chls == 0.0 and bypass_ucc == aft_cans_user,
+      'cans-user ?unit=CHLS=%.0f (expect 0), ?unit=UCC=%.0f (expect own %.0f)' % (bypass_chls, bypass_ucc, aft_cans_user))
+
 # 5. Scoped LIST isolation: the CANS user's JV list has the CANS voucher, not the CHLS one.
 jl = cans('/api/jvs')
 jl = jl if isinstance(jl, list) else (jl.get('jvs') or jl.get('data') or [])
