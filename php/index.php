@@ -501,6 +501,18 @@ function api_accounting_periods(): void {
     require_auth();
     send(db()->query('SELECT * FROM accounting_periods ORDER BY period DESC')->fetchAll());
 }
+// POST /api/accounting-periods {action: close|open|lock|reopen, period} — period gate.
+function api_accounting_period_action(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body();
+    $action = strtolower((string)($d['action'] ?? '')); $period = (string)($d['period'] ?? '');
+    if ($period === '') err('period is required');
+    $status = ['close' => 'Closed', 'open' => 'Open', 'lock' => 'Locked', 'reopen' => 'Open'][$action] ?? null;
+    if (!$status) err('Unknown action: ' . $action);
+    $ex = db()->prepare('SELECT id FROM accounting_periods WHERE period=?'); $ex->execute([$period]);
+    if ($ex->fetchColumn()) db()->prepare('UPDATE accounting_periods SET status=? WHERE period=?')->execute([$status, $period]);
+    else db()->prepare('INSERT INTO accounting_periods(id,period,period_name,status,opened_by) VALUES(?,?,?,?,?)')->execute([uuid4(), $period, $period, $status, 'php-port']);
+    ok(['period' => $period, 'status' => $status]);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3a — Payments (PV) + Ghana tax engine + budgets / commitments / vendors.
@@ -676,9 +688,18 @@ function api_actual_save(): void {
     if (!empty($d['id'])) { api_actual_update(); return; }
     if (empty($d['project_id'])) err('project_id is required');
     if (empty($d['expense_coa_id']) && empty($d['budget_id'])) err('expense account (expense_coa_id) is required');
-    $pay_fx = (float)($d['pay_fx_rate'] ?? 1);
+    $pay_fx = (float)($d['pay_fx_rate'] ?? ($d['fx_rate'] ?? 1));
+    $commit_fx = (float)($d['commit_fx_rate'] ?? 0);
+    $currency = $d['currency'] ?? 'GHS';
     $amount_fcy = (float)($d['amount_fcy'] ?? 0);
-    $amount_ghs = $amount_fcy * $pay_fx;
+    $amount_ghs = round($amount_fcy * $pay_fx, 2);
+    // IAS 21 / IPSAS 4 exchange difference: a foreign-currency PV committed at one
+    // rate and paid at another realises a gain (rate fell) or loss (rate rose).
+    $fx_gl_ghs = 0.0; $fx_gl_type = null;
+    if ($currency !== 'GHS' && $commit_fx > 0 && abs($pay_fx - $commit_fx) > 1e-9) {
+        $fx_gl_ghs = round($amount_fcy * ($pay_fx - $commit_fx), 2);
+        $fx_gl_type = $pay_fx > $commit_fx ? 'Loss' : 'Gain';
+    }
     $has_vat = (int)($d['has_vat'] ?? 0); $has_whvat = (int)($d['has_whvat'] ?? 0); $has_ucf = (int)($d['has_ucf'] ?? 0);
     $wht_type = (string)($d['wht_type'] ?? 'None');
     $t = compute_tax($amount_ghs, $has_vat, $has_whvat, $wht_type, $has_ucf);
@@ -687,16 +708,16 @@ function api_actual_save(): void {
     require_write_unit($u, $d, 'payment voucher');
     $unit = resolve_write_unit($u, $d);
     db()->prepare("INSERT INTO actuals(id,actual_code,project_id,budget_id,commitment_id,expense_date,payee,description,
-        currency,amount_fcy,pay_fx_rate,amount_ghs,has_vat,vat_amount,has_whvat,whvat_amount,has_ucf,ucf_amount,
+        currency,amount_fcy,commit_fx_rate,pay_fx_rate,amount_ghs,fx_gl_ghs,fx_gl_type,has_vat,vat_amount,has_whvat,whvat_amount,has_ucf,ucf_amount,
         wht_type,wht_rate,wht_amount,receipt_no,expense_coa_id,is_posted,created_by,unit_id)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)")
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)")
         ->execute([$id, $code, $d['project_id'], $d['budget_id'] ?? null, $d['commitment_id'] ?? null,
             $d['expense_date'] ?? date('Y-m-d'), $d['payee'] ?? '', $d['description'] ?? '',
-            $d['currency'] ?? 'GHS', $amount_fcy, $pay_fx, $amount_ghs,
+            $currency, $amount_fcy, $commit_fx ?: null, $pay_fx, $amount_ghs, $fx_gl_ghs, $fx_gl_type,
             $has_vat, $t['vat'], $has_whvat, $t['whvat'], $has_ucf, $t['ucf'],
             $wht_type, $t['wht_rate'], $t['wht'], $d['receipt_no'] ?? '', $d['expense_coa_id'] ?? null,
             $u['username'], $unit]);
-    ok(['id' => $id, 'actual_code' => $code, 'tax' => $t]);
+    ok(['id' => $id, 'actual_code' => $code, 'tax' => $t, 'fx_gl_ghs' => $fx_gl_ghs, 'fx_gl_type' => $fx_gl_type]);
 }
 function ensure_actual_lines(): void {
     db()->exec("CREATE TABLE IF NOT EXISTS actual_lines(id TEXT PRIMARY KEY, actual_id TEXT, line_no INTEGER, project_id TEXT,
@@ -1417,6 +1438,8 @@ function api_ar_receipt(): void {
     $st = db()->prepare('SELECT * FROM ar_invoices WHERE id=?'); $st->execute([$iid]); $inv = $st->fetch();
     if (!$inv) err('Invoice not found');
     if (($inv['status'] ?? '') === 'Draft') err('Post the invoice before receipting against it');
+    $rdate = (string)($d['receipt_date'] ?? date('Y-m-d'));
+    if (!empty($inv['invoice_date']) && substr($rdate, 0, 10) < substr((string)$inv['invoice_date'], 0, 10)) err('Receipt date cannot be earlier than the invoice date (' . substr((string)$inv['invoice_date'], 0, 10) . ')');
     $total = round((float)$inv['total_ghs'], 2); $recd = round((float)($inv['amount_received'] ?? 0), 2); $bal = round($total - $recd, 2);
     if ($amt > $bal + 0.01) err('Receipt exceeds the outstanding balance of GHS ' . number_format($bal, 2));
     $bcoa = bank_coa_from_account((string)($d['bank_account_id'] ?? '')); if (!$bcoa) err('Bank account could not be resolved');
@@ -1438,6 +1461,8 @@ function api_ap_payment(): void {
     $st = db()->prepare('SELECT * FROM ap_bills WHERE id=?'); $st->execute([$bid]); $bill = $st->fetch();
     if (!$bill) err('Bill not found');
     if (($bill['status'] ?? '') === 'Draft') err('Post the bill before paying it');
+    $pdate = (string)($d['payment_date'] ?? date('Y-m-d'));
+    if (!empty($bill['bill_date']) && substr($pdate, 0, 10) < substr((string)$bill['bill_date'], 0, 10)) err('Payment date cannot be earlier than the bill date (' . substr((string)$bill['bill_date'], 0, 10) . ')');
     $total = round((float)$bill['total_ghs'], 2); $paid = round((float)($bill['amount_paid'] ?? 0), 2); $bal = round($total - $paid, 2);
     if ($amt > $bal + 0.01) err('Payment exceeds the outstanding balance of GHS ' . number_format($bal, 2));
     $bcoa = bank_coa_from_account((string)($d['bank_account_id'] ?? '')); if (!$bcoa) err('Bank account could not be resolved');
@@ -3418,6 +3443,7 @@ try {
     if ($path === '/api/journals/redate' && $method === 'POST') api_redate_reversal();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
+    if ($path === '/api/accounting-periods' && $method === 'POST') api_accounting_period_action();
 
     // Phase 3a — payments (PV) + tax engine + budgets/commitments/vendors
     if (($path === '/api/vendors' || $path === '/api/ap/vendors') && $method === 'GET') api_vendors_list();
