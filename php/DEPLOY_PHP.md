@@ -87,5 +87,7 @@ router) now renders with **zero console errors** against the PHP backend — sev
 view feeds (fuel-coupons, fx-rates, audit, payroll months/employees/settings,
 quarterly-budgets, budget-periods, budget-uploads, departments, procure-to-pay,
 vendors, approvals) were added/shape-aligned to the bare-array/object shapes the SPA
-expects. Remaining before a hard cut-over: load/perf profiling, and SMTP wiring for
-the email/dunning/remittance features (they queue gracefully when SMTP is off).
+expects. Performance: all GET endpoints time 2–5ms warm on a populated DB; the port self-
+ensures its hot indexes (`ensure_perf_indexes`). SMTP: `/api/email/status` shows the
+outbox + config state; the only go-live step left is setting `SMTP_HOST/PORT/USER/
+PASSWORD/FROM` on the server (email/dunning/remittance queue gracefully until then).
