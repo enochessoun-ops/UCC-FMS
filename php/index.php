@@ -949,6 +949,16 @@ function api_actual_update(): void {
             $has_vat, $t['vat'], $has_whvat, $t['whvat'], $has_ucf, $t['ucf'], $wht_type, $t['wht_rate'], $t['wht'], $aid]);
     api_actual_post(); // re-post the amended PV (reads the same body 'id'); ok() exits
 }
+// DELETE /api/actuals/{id} — remove a DRAFT (unposted) voucher and its itemised lines.
+function api_actual_delete(string $aid): void {
+    $u = require_role(['Admin', 'Finance Officer']);
+    $st = db()->prepare('SELECT * FROM actuals WHERE id=?'); $st->execute([$aid]); $a = $st->fetch();
+    if (!$a) err('Expense not found');
+    if ((int)($a['is_posted'] ?? 0) === 1) err('Cannot delete a posted voucher — reverse it instead');
+    try { db()->prepare('DELETE FROM actual_lines WHERE actual_id=?')->execute([$aid]); } catch (Throwable $e) {}
+    db()->prepare('DELETE FROM actuals WHERE id=?')->execute([$aid]);
+    ok(['deleted' => true, 'id' => $aid]);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3b — Receipts (RV) + JV workflow (submit→approve→post with segregation of
@@ -1093,6 +1103,13 @@ function api_jv_workflow(): void {
         if (in_array((string)($jv['source_module'] ?? ''), ['fund_receipts', 'receipts'], true) && !empty($jv['source_id'])) {
             try { db()->prepare("UPDATE fund_receipts SET is_posted=0 WHERE id=?")->execute([$jv['source_id']]); } catch (Throwable $e) {}
         }
+        // Reversing a withholding-remittance JV un-pays the payable (back to Pending) so it
+        // can be re-remitted correctly. Match by source_id or by the stored settlement JV.
+        try {
+            ensure_col('withholding_payables', 'settlement_jv_id');
+            db()->prepare("UPDATE withholding_payables SET status='Pending', settled_jv=NULL, settlement_jv_id=NULL WHERE settlement_jv_id=? OR (?<>'' AND id=? AND ?='withholding_settlement')")
+                ->execute([$jid, (string)($jv['source_module'] ?? ''), (string)($jv['source_id'] ?? ''), (string)($jv['source_module'] ?? '')]);
+        } catch (Throwable $e) {}
         ok(['new_status' => 'Reversed', 'jv_number' => $jv['jv_number'], 'reversal_jv' => $rnum, 'rev_date' => $rdate]);
     }
     err("Unknown action: $action");
@@ -3331,8 +3348,9 @@ function ensure_wh_table(): void {
     db()->exec("CREATE TABLE IF NOT EXISTS withholding_payables(id TEXT PRIMARY KEY, actual_id TEXT, source_pv_number TEXT,
         payable_type TEXT, payable_label TEXT, beneficiary TEXT, coa_id TEXT, project_id TEXT, amount_ghs REAL,
         status TEXT DEFAULT 'Pending', due_date TEXT, settled_jv TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
-    // The table may pre-exist from the Python seed without this column.
+    // The table may pre-exist from the Python seed without these columns.
     ensure_col('withholding_payables', 'settled_jv');
+    ensure_col('withholding_payables', 'settlement_jv_id');
 }
 // Maintain the withholding subledger for a PV (single- or multi-line). UPSERT keyed
 // on (actual_id, payable_type): create on first post, update IN PLACE on a re-post
@@ -3385,8 +3403,15 @@ function api_withholding_settle(): void {
     $st = db()->prepare('SELECT * FROM withholding_payables WHERE id=?'); $st->execute([$id]); $w = $st->fetch();
     if (!$w) err('Withholding payable not found');
     if (in_array(strtolower((string)$w['status']), ['settled', 'paid', 'remitted'], true)) err('Already settled');
+    if (strtolower((string)$w['status']) === 'awaiting posting') err('The source voucher must be posted before its withholding can be remitted');
     $bank = bank_coa_from_account((string)($d['bank_account_id'] ?? '')); if (!$bank) err('Bank account could not be resolved');
     $amt = round((float)$w['amount_ghs'], 2);
+    $date = substr((string)($d['payment_date'] ?? date('Y-m-d')), 0, 10);
+    // A remittance cannot be dated before the voucher that gave rise to the liability.
+    if (!empty($w['actual_id'])) {
+        $sd = db()->prepare('SELECT expense_date FROM actuals WHERE id=?'); $sd->execute([$w['actual_id']]); $src = $sd->fetchColumn();
+        if ($src && $date < substr((string)$src, 0, 10)) err('Remittance date cannot be earlier than the source voucher date (' . substr((string)$src, 0, 10) . ')');
+    }
     // Self-describing remittance narration: "<rate>% WHT - <payee> - <purpose> (source <PV>)".
     $payee = (string)($w['beneficiary'] ?? ''); $rate_pct = '';
     if (!empty($w['actual_id'])) {
@@ -3400,12 +3425,12 @@ function api_withholding_settle(): void {
     $desc = $head . ' - ' . $payee . ' - remittance to ' . (string)($w['beneficiary'] ?? 'authority') . ' (source ' . (string)($w['source_pv_number'] ?? '') . ')';
     $lines = [['coa_id' => $w['coa_id'], 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => $desc],
               ['coa_id' => $bank, 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Payment to ' . (string)($w['beneficiary'] ?? '')]];
-    $date = substr((string)($d['payment_date'] ?? date('Y-m-d')), 0, 10);
     try { [$jid, $jvnum] = post_journal($u, 'PV', $date, substr($date, 0, 7), $desc, $lines, 'withholding_settlement', $id, resolve_write_unit($u, $d)); }
     catch (Throwable $e) { err('Settlement posting failed: ' . $e->getMessage()); }
     // 'Paid' satisfies the table's status CHECK and the suite's "settled" filter.
-    db()->prepare("UPDATE withholding_payables SET status='Paid', settled_jv=? WHERE id=?")->execute([$jvnum, $id]);
-    ok(['status' => 'Paid', 'jv_number' => $jvnum, 'amount' => $amt]);
+    ensure_col('withholding_payables', 'settlement_jv_id');
+    db()->prepare("UPDATE withholding_payables SET status='Paid', settled_jv=?, settlement_jv_id=? WHERE id=?")->execute([$jvnum, $jid, $id]);
+    ok(['status' => 'Paid', 'jv_number' => $jvnum, 'settlement_jv_id' => $jid, 'amount' => $amt]);
 }
 
 // ── Fuel coupons (procurement → Dr Fuel Stock / Cr Bank) ────────────────────
@@ -3852,6 +3877,7 @@ try {
     if ($path === '/api/budgets' && $method === 'POST') api_budget_save();
     if ($path === '/api/commitments' && $method === 'GET') api_commitments_list();
     if ($path === '/api/commitments' && $method === 'POST') api_commitment_save();
+    if ($method === 'DELETE' && preg_match('#^/api/actuals/([A-Za-z0-9-]+)$#', $path, $am)) api_actual_delete($am[1]);
     if ($path === '/api/actuals' && $method === 'GET') api_actuals_list();
     if ($path === '/api/actuals' && $method === 'POST') api_actual_save();
     if ($path === '/api/actuals/post' && $method === 'POST') api_actual_post();
