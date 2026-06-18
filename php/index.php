@@ -3170,6 +3170,17 @@ function api_finance_overview(): void {
         'current_assets' => $ca, 'net_working_capital' => $nwc, 'overdue_customers' => $overdue,
         'low_stock_items' => $low, 'pos_to_bill' => $pos, 'tax_outstanding' => $tax, 'unbudgeted_total' => $unb]);
 }
+// Command-centre roll-up. total_committed is the OPEN encumbrance: each live
+// commitment's amount less posted actuals charged to it (mirror server.py).
+function api_dashboard(): void {
+    require_auth();
+    $tc = round((float)(db()->query("SELECT COALESCE(SUM(MAX(0, cmt.amount_ghs - COALESCE((SELECT SUM(ax.amount_ghs) FROM actuals ax WHERE ax.commitment_id=cmt.id AND COALESCE(ax.is_posted,0)=1),0))),0) FROM commitments cmt WHERE COALESCE(cmt.status,'') NOT IN ('Cancelled','Fully Paid')")->fetchColumn() ?: 0), 2);
+    $tb = round((float)(db()->query("SELECT COALESCE(SUM(budget_ghs),0) FROM budgets WHERE COALESCE(is_deleted,0)=0")->fetchColumn() ?: 0), 2);
+    $ts = round((float)(db()->query("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE COALESCE(is_posted,0)=1")->fetchColumn() ?: 0), 2);
+    $tr = 0.0; try { $tr = round((float)(db()->query("SELECT COALESCE(SUM(amount_ghs),0) FROM fund_receipts WHERE COALESCE(is_posted,0)=1")->fetchColumn() ?: 0), 2); } catch (Throwable $e) {}
+    $stats = ['total_committed' => $tc, 'total_budget' => $tb, 'total_spent' => $ts, 'total_received' => $tr];
+    ok(array_merge($stats, ['stats' => $stats]));
+}
 // Reconciliation: posted actuals split into budget-linked vs unbudgeted (sum = total).
 function api_unbudgeted_spend(): void {
     require_auth();
@@ -3477,6 +3488,7 @@ try {
     if ($path === '/api/consolidation/export' && $method === 'GET') api_consolidation_export();
     if ($path === '/api/finance-overview' && $method === 'GET') api_finance_overview();
     if ($path === '/api/unbudgeted-spend' && $method === 'GET') api_unbudgeted_spend();
+    if ($path === '/api/dashboard' && $method === 'GET') api_dashboard();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
