@@ -2848,7 +2848,7 @@ function api_flash_pack(): void {
         'income_expenditure' => ['income_period' => $inc_p, 'expenditure_period' => $exp_p, 'surplus_period' => round($inc_p - $exp_p, 2),
                                  'income_ytd' => $inc_y, 'expenditure_ytd' => $exp_y, 'surplus_ytd' => round($inc_y - $exp_y, 2)],
         'trial_balance' => ['total_debit' => $tb_dr, 'total_credit' => $tb_cr, 'balanced' => abs($tb_dr - $tb_cr) < 0.05, 'difference' => round($tb_dr - $tb_cr, 2)],
-        'working_capital' => working_capital_data(),
+        'working_capital' => working_capital_data($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null)),
         'top_expenditure' => $top]);
 }
 
@@ -4287,13 +4287,15 @@ function api_finance_overview(): void {
 // ── AR/AP aging + working-capital (the Receivables/Payables/Working-Capital views
 //    render degraded without these). Shared helpers so /api/working-capital,
 //    /api/flash-pack and the gate's roll-up all agree. Mirror server.py.
-function ar_aging_data(): array {
+function ar_aging_data(?array $u = null, ?string $node = null): array {
     ensure_arap_tables(); ensure_col('ar_invoices', 'credited_ghs', 'REAL');
-    $rows = db()->query("SELECT i.id,i.invoice_number,i.invoice_date,i.due_date,i.total_ghs,i.amount_received,
+    [$sw, $sp] = $u ? unit_scope_sql($u, 'i', $node) : ['', []];
+    $st = db()->prepare("SELECT i.id,i.invoice_number,i.invoice_date,i.due_date,i.total_ghs,i.amount_received,
         ROUND(i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0),2) AS balance, c.customer_name, c.customer_code
         FROM ar_invoices i LEFT JOIN ar_customers c ON c.id=i.customer_id
-        WHERE i.status IN ('Posted','Part-Paid') AND (i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0)) > 0.01
-        ORDER BY c.customer_name, i.due_date")->fetchAll();
+        WHERE i.status IN ('Posted','Part-Paid') AND (i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0)) > 0.01$sw
+        ORDER BY c.customer_name, i.due_date");
+    $st->execute($sp); $rows = $st->fetchAll();
     $b = ['current' => 0.0, 'b1_30' => 0.0, 'b31_60' => 0.0, 'b61_90' => 0.0, 'b90_plus' => 0.0]; $per = []; $today = time();
     foreach ($rows as &$r) {
         $bal = round((float)$r['balance'], 2); $days = 0;
@@ -4308,13 +4310,15 @@ function ar_aging_data(): array {
     foreach ($per as &$pc) { foreach ($pc as $k => $v) if ($k !== 'customer') $pc[$k] = round((float)$v, 2); } unset($pc);
     return ['buckets' => $b, 'by_customer' => array_values($per), 'invoices' => $rows, 'total_outstanding' => round(array_sum($b), 2)];
 }
-function ap_aging_data(): array {
+function ap_aging_data(?array $u = null, ?string $node = null): array {
     ensure_arap_tables(); ensure_col('ap_bills', 'debited_ghs', 'REAL');
-    $rows = db()->query("SELECT b.id,b.bill_number,b.bill_date,b.due_date,b.total_ghs,b.amount_paid,
+    [$sw, $sp] = $u ? unit_scope_sql($u, 'b', $node) : ['', []];
+    $st = db()->prepare("SELECT b.id,b.bill_number,b.bill_date,b.due_date,b.total_ghs,b.amount_paid,
         ROUND(b.total_ghs - COALESCE(b.amount_paid,0) - COALESCE(b.debited_ghs,0),2) AS balance, v.vendor_name, v.vendor_code
         FROM ap_bills b LEFT JOIN vendors v ON v.id=b.vendor_id
-        WHERE b.status IN ('Posted','Part-Paid') AND (b.total_ghs - COALESCE(b.amount_paid,0) - COALESCE(b.debited_ghs,0)) > 0.01
-        ORDER BY v.vendor_name, b.due_date")->fetchAll();
+        WHERE b.status IN ('Posted','Part-Paid') AND (b.total_ghs - COALESCE(b.amount_paid,0) - COALESCE(b.debited_ghs,0)) > 0.01$sw
+        ORDER BY v.vendor_name, b.due_date");
+    $st->execute($sp); $rows = $st->fetchAll();
     $b = ['current' => 0.0, 'b1_30' => 0.0, 'b31_60' => 0.0, 'b61_90' => 0.0, 'b90_plus' => 0.0]; $per = []; $today = time();
     foreach ($rows as &$r) {
         $bal = round((float)$r['balance'], 2); $days = 0;
@@ -4329,12 +4333,13 @@ function ap_aging_data(): array {
     foreach ($per as &$pc) { foreach ($pc as $k => $v) if ($k !== 'vendor') $pc[$k] = round((float)$v, 2); } unset($pc);
     return ['buckets' => $b, 'by_vendor' => array_values($per), 'bills' => $rows, 'total_outstanding' => round(array_sum($b), 2)];
 }
-function working_capital_data(): array {
-    $ar = ar_aging_data(); $ap = ap_aging_data();
+function working_capital_data(?array $u = null, ?string $node = null): array {
+    $ar = ar_aging_data($u, $node); $ap = ap_aging_data($u, $node);
     $ar_out = round((float)$ar['total_outstanding'], 2); $ap_out = round((float)$ap['total_outstanding'], 2);
     $arb = $ar['buckets']; $apb = $ap['buckets'];
-    $sc = function ($sql) { try { $v = db()->query($sql)->fetchColumn(); return ($v === false || $v === null) ? 0.0 : (float)$v; } catch (Throwable $e) { return 0.0; } };
-    $cash = round($sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '126%' OR coa_code LIKE '127%' OR coa_code LIKE '128%' OR coa_code LIKE '129%' OR coa_code='1001' OR coa_id IN (SELECT coa_id FROM bank_accounts WHERE coa_id IS NOT NULL)"), 2);
+    [$gw, $gp] = $u ? gl_scope_sql($u, $node) : ['', []];
+    $sc = function ($sql, $p = []) { try { $st = db()->prepare($sql); $st->execute($p); $v = $st->fetchColumn(); return ($v === false || $v === null) ? 0.0 : (float)$v; } catch (Throwable $e) { return 0.0; } };
+    $cash = round($sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE (gl.coa_code LIKE '126%' OR gl.coa_code LIKE '127%' OR gl.coa_code LIKE '128%' OR gl.coa_code LIKE '129%' OR gl.coa_code='1001' OR gl.coa_id IN (SELECT coa_id FROM bank_accounts WHERE coa_id IS NOT NULL))$gw", $gp), 2);
     $inv = 0.0; try { ensure_inv_tables(); $inv = round((float)(db()->query("SELECT COALESCE(SUM(COALESCE(qty_on_hand,0)*COALESCE(avg_cost,0)),0) FROM inv_items")->fetchColumn() ?: 0), 2); } catch (Throwable $e) {}
     $ca = round($cash + $ar_out + $inv, 2); $cl = round($ap_out, 2); $nwc = round($ca - $cl, 2);
     return ['cash_and_bank_ghs' => $cash, 'receivables_ghs' => $ar_out, 'receivables_overdue_ghs' => round($ar_out - (float)($arb['current'] ?? 0), 2),
@@ -4343,9 +4348,9 @@ function working_capital_data(): array {
         'current_ratio' => $cl > 0.005 ? round($ca / $cl, 2) : null, 'quick_ratio' => $cl > 0.005 ? round(($cash + $ar_out) / $cl, 2) : null,
         'ar_buckets' => $arb, 'ap_buckets' => $apb, 'as_of' => date('Y-m-d')];
 }
-function api_ar_aging(): void { require_auth(); ok(ar_aging_data()); }
-function api_ap_aging(): void { require_auth(); ok(ap_aging_data()); }
-function api_working_capital(): void { require_auth(); ok(working_capital_data()); }
+function api_ar_aging(): void { $u = require_auth(); ok(ar_aging_data($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null))); }
+function api_ap_aging(): void { $u = require_auth(); ok(ap_aging_data($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null))); }
+function api_working_capital(): void { $u = require_auth(); ok(working_capital_data($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null))); }
 function api_users_list(): void { require_role(['Admin']); send(db()->query("SELECT id,username,full_name,role,email,active,created_at,home_unit_id,scope FROM users ORDER BY username")->fetchAll()); }
 
 // ── Governance / meta / readiness endpoints ───────────────────────────────────
@@ -4884,7 +4889,8 @@ function api_financial_integrity(): void {
 // ── Cash book: opening + receipts(Dr) − payments(Cr) = closing, with optional
 //    net view that hides a reversed entry together with its reversal (both in window). ─
 function api_cashbook(): void {
-    require_auth();
+    $u = require_auth();
+    [$sw, $sp] = gl_scope_sql($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null)); // unit subtree; admin unrestricted
     $dt = $_GET['date_to'] ?? ($_GET['period_to'] ?? date('Y-m-d'));
     $df = $_GET['date_from'] ?? ($_GET['period_from'] ?? (substr((string)$dt, 0, 7) . '-01'));
     $where = ''; $params = [];
@@ -4894,10 +4900,10 @@ function api_cashbook(): void {
     }
     if ($where === '') $where = "(gl.coa_code LIKE '126%' OR gl.coa_code LIKE '127%' OR gl.coa_code LIKE '128%' OR gl.coa_code LIKE '129%' OR gl.coa_code='1001')";
     $net = $_GET['net'] ?? '1'; $net_on = !in_array((string)$net, ['0', 'false', 'no', ''], true);
-    $op = db()->prepare("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE $where AND gl.ledger_date < ?");
-    $op->execute(array_merge($params, [$df])); $opening = round((float)$op->fetchColumn(), 2);
-    $rq = db()->prepare("SELECT gl.ledger_date, gl.jv_number, gl.description, COALESCE(gl.debit_amount,0) AS receipt, COALESCE(gl.credit_amount,0) AS payment FROM general_ledger gl WHERE $where AND gl.ledger_date BETWEEN ? AND ? ORDER BY gl.ledger_date, gl.jv_number");
-    $rq->execute(array_merge($params, [$df, $dt])); $rows = $rq->fetchAll();
+    $op = db()->prepare("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE $where AND gl.ledger_date < ?$sw");
+    $op->execute(array_merge($params, [$df], $sp)); $opening = round((float)$op->fetchColumn(), 2);
+    $rq = db()->prepare("SELECT gl.ledger_date, gl.jv_number, gl.description, COALESCE(gl.debit_amount,0) AS receipt, COALESCE(gl.credit_amount,0) AS payment FROM general_ledger gl WHERE $where AND gl.ledger_date BETWEEN ? AND ?$sw ORDER BY gl.ledger_date, gl.jv_number");
+    $rq->execute(array_merge($params, [$df, $dt], $sp)); $rows = $rq->fetchAll();
     $hidden = 0;
     if ($net_on && $rows) {
         $present = []; foreach ($rows as $r) if (!empty($r['jv_number'])) $present[$r['jv_number']] = true;
