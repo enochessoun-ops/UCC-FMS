@@ -24,7 +24,10 @@ function db(): PDO {
     $path = getenv('SBS_DB');
     if (!$path) {
         $dir = getenv('RENDER_DATA_DIR') ?: (is_dir('/var/data') ? '/var/data' : dirname(__DIR__));
-        $path = rtrim($dir, '/') . '/sbs_fms.db';
+        // UCC FMS's Python reference names its database ucc_fms.db; fall back to the
+        // legacy sbs_fms.db only if the UCC file isn't present (shared-base heritage).
+        $ucc = rtrim($dir, '/') . '/ucc_fms.db';
+        $path = (file_exists($ucc) || !file_exists(rtrim($dir, '/') . '/sbs_fms.db')) ? $ucc : rtrim($dir, '/') . '/sbs_fms.db';
     }
     $pdo = new PDO('sqlite:' . $path, null, null, [
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
@@ -1889,6 +1892,53 @@ function api_fuel_batch_post(): void {
     ok(['status' => 'Posted', 'jv_number' => $jvnum, 'cost' => $cost]);
 }
 
+// ── Reports: Trends + Consolidation export (mirror server.py) ───────────────
+function api_trends(): void {
+    require_auth();
+    $n = max(1, min(24, (int)($_GET['months'] ?? 6)));
+    $y = (int)date('Y'); $m = (int)date('n'); $periods = [];
+    for ($i = 0; $i < $n; $i++) { $periods[] = sprintf('%04d-%02d', $y, $m); $m--; if ($m === 0) { $m = 12; $y--; } }
+    $periods = array_reverse($periods);
+    $st = db()->prepare(
+        "SELECT substr(gl.ledger_date,1,7) AS mo, " .
+        "SUM(CASE WHEN substr(COALESCE(NULLIF(gl.coa_code,''),c.code,''),1,1) IN ('4','7') THEN COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0) ELSE 0 END) AS inc, " .
+        "SUM(CASE WHEN substr(COALESCE(NULLIF(gl.coa_code,''),c.code,''),1,1) IN ('5','6') THEN COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0) ELSE 0 END) AS exp " .
+        "FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id " .
+        "LEFT JOIN journal_vouchers jv ON jv.id=gl.jv_id " .
+        "WHERE substr(gl.ledger_date,1,7) BETWEEN ? AND ? AND (jv.status IS NULL OR jv.status='Posted') " .
+        "GROUP BY substr(gl.ledger_date,1,7)");
+    $st->execute([$periods[0], $periods[count($periods) - 1]]);
+    $map = [];
+    foreach ($st->fetchAll() as $r) { $map[$r['mo']] = [round((float)$r['inc'], 2), round((float)$r['exp'], 2)]; }
+    $series = [];
+    foreach ($periods as $p) { [$inc, $exp] = $map[$p] ?? [0.0, 0.0]; $series[] = ['period' => $p, 'income' => $inc, 'expenditure' => $exp, 'surplus' => round($inc - $exp, 2)]; }
+    ok(['series' => $series]);
+}
+function api_consolidation_export(): void {
+    $u = require_auth();
+    $pf = $_GET['period_from'] ?? (date('Y') . '-01-01');
+    $pt = $_GET['period_to'] ?? date('Y-m-d');
+    $st = db()->prepare(
+        "SELECT gl.coa_code AS code, MAX(gl.account_name) AS nm, COALESCE(MAX(c.account_type),'') AS at, " .
+        "COALESCE(SUM(gl.debit_amount),0) AS dr, COALESCE(SUM(gl.credit_amount),0) AS cr " .
+        "FROM general_ledger gl LEFT JOIN chart_of_accounts c ON c.id=gl.coa_id " .
+        "WHERE gl.ledger_date <= ? GROUP BY gl.coa_code ORDER BY gl.coa_code");
+    $st->execute([substr((string)$pt, 0, 10)]);
+    $lines = []; $tdr = 0.0; $tcr = 0.0;
+    foreach ($st->fetchAll() as $r) {
+        if (($r['code'] ?? '') === '') continue;
+        $dr = round((float)$r['dr'], 2); $cr = round((float)$r['cr'], 2);
+        if (!$dr && !$cr) continue;
+        $lines[] = ['code' => $r['code'], 'name' => $r['nm'] ?? '', 'debit' => $dr, 'credit' => $cr];
+        $tdr += $dr; $tcr += $cr;
+    }
+    $name = (string)(setting_get('institution_name', 'UCC FMS') ?? 'UCC FMS');
+    ok(['entity_code' => (string)(setting_get('institution_code', 'UCC') ?? 'UCC'), 'entity_name' => $name,
+        'period_from' => $pf, 'period_to' => $pt,
+        'total_debit' => round($tdr, 2), 'total_credit' => round($tcr, 2),
+        'lines' => $lines, 'format' => 'ucc-consolidation-v1']);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -1934,6 +1984,8 @@ try {
     if ($path === '/api/journal-vouchers/post' && $method === 'POST') api_jv_post();
     if ($path === '/api/ledger-summary' && $method === 'GET') api_ledger_summary();
     if ($path === '/api/trial-balance' && $method === 'GET') api_trial_balance();
+    if ($path === '/api/trends' && $method === 'GET') api_trends();
+    if ($path === '/api/consolidation/export' && $method === 'GET') api_consolidation_export();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
 
