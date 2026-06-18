@@ -3686,6 +3686,27 @@ function api_dashboard(): void {
     $stats = ['total_committed' => $tc, 'total_budget' => $tb, 'total_spent' => $ts, 'total_received' => $tr];
     ok(array_merge($stats, ['stats' => $stats]));
 }
+// Per-department roll-up the SPA dashboard consumes (returns a BARE ARRAY — the
+// dashboard does depts.reduce(...) over it). Mirror server.py api_dept_summary.
+function api_dept_summary(): void {
+    require_auth();
+    try {
+        $rows = db()->query("
+            SELECT d.dept_code, d.dept_name, d.head_name,
+              COALESCE((SELECT SUM(a.amount_ghs) FROM dept_allocations a WHERE a.dept_code=d.dept_code),0)
+              + COALESCE((SELECT SUM(qb.annual_total) FROM quarterly_budgets qb WHERE qb.dept_code=d.dept_code AND COALESCE(qb.is_deleted,0)=0 AND qb.approval_status='Approved'),0) AS allocated,
+              COALESCE((SELECT SUM(ac.amount_ghs) FROM actuals ac INNER JOIN projects p ON ac.project_id=p.id WHERE p.division=d.dept_code),0) AS spent,
+              COALESCE((SELECT SUM(cm.amount_ghs) FROM commitments cm INNER JOIN projects p2 ON cm.project_id=p2.id WHERE p2.division=d.dept_code),0) AS committed,
+              COALESCE((SELECT COUNT(*) FROM projects p WHERE p.division=d.dept_code AND p.status='Active'),0) AS active_grants,
+              COALESCE((SELECT SUM(p.budget_ghs) FROM projects p WHERE p.division=d.dept_code),0) AS grant_budget
+            FROM departments d WHERE d.status='Active' ORDER BY d.dept_code")->fetchAll();
+        send($rows);
+    } catch (Throwable $e) {
+        // Defensive: never break the dashboard render — fall back to a plain dept list.
+        try { send(db()->query("SELECT dept_code, dept_name, head_name, 0 AS allocated, 0 AS spent, 0 AS committed, 0 AS active_grants, 0 AS grant_budget FROM departments ORDER BY dept_code")->fetchAll()); }
+        catch (Throwable $e2) { send([]); }
+    }
+}
 // Reconciliation: posted actuals split into budget-linked vs unbudgeted (sum = total).
 function api_unbudgeted_spend(): void {
     require_auth();
@@ -4007,6 +4028,7 @@ try {
     if ($path === '/api/finance-overview' && $method === 'GET') api_finance_overview();
     if ($path === '/api/unbudgeted-spend' && $method === 'GET') api_unbudgeted_spend();
     if ($path === '/api/dashboard' && $method === 'GET') api_dashboard();
+    if ($path === '/api/dept-summary' && $method === 'GET') api_dept_summary();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
