@@ -670,6 +670,9 @@ function api_actual_save(): void {
     $u = require_role(['Admin', 'Finance Officer', 'Project Leader']);
     ensure_col('actuals', 'expense_coa_id'); ensure_col('actuals', 'unit_id');
     $d = body();
+    // Editing an existing PV (id supplied) is an audit-controlled correction: delegate to
+    // the update path, which reverses the original posting and re-posts the amended voucher.
+    if (!empty($d['id'])) { api_actual_update(); return; }
     if (empty($d['project_id'])) err('project_id is required');
     if (empty($d['expense_coa_id']) && empty($d['budget_id'])) err('expense account (expense_coa_id) is required');
     $pay_fx = (float)($d['pay_fx_rate'] ?? 1);
