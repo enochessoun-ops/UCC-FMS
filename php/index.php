@@ -14,6 +14,12 @@
  */
 
 declare(strict_types=1);
+// Production hardening: log PHP notices/warnings/deprecations, NEVER echo them into
+// the response body (a leaked warning corrupts the JSON envelope). Fatals still surface
+// via the front-controller try/catch as a clean JSON error.
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
 header('Content-Type: application/json');
 header('X-Content-Type-Options: nosniff');
 
