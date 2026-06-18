@@ -2244,6 +2244,136 @@ function api_fuel_stock_health(): void {
         'returned_borrowed_value' => round($returned_borrowed, 2), 'by_denomination' => $byd, 'warnings' => []]);
 }
 
+// ── Procurement (P2P): PO → GRN → 3-way match → AP bill, + inventory reorder.
+function ensure_proc_tables(): void {
+    $p = db();
+    $p->exec("CREATE TABLE IF NOT EXISTS purchase_orders(id TEXT PRIMARY KEY, po_number TEXT, pr_id TEXT, vendor_id TEXT, vendor_name TEXT, project_id TEXT, po_date TEXT, delivery_date TEXT, total_amount_ghs REAL DEFAULT 0, currency TEXT DEFAULT 'GHS', status TEXT DEFAULT 'Draft', terms TEXT, notes TEXT, approved_by TEXT, approved_at TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    $p->exec("CREATE TABLE IF NOT EXISTS po_line_items(id TEXT PRIMARY KEY, po_id TEXT, description TEXT, quantity REAL DEFAULT 0, unit TEXT, unit_price_ghs REAL DEFAULT 0, total_ghs REAL DEFAULT 0, coa_code TEXT, coa_id TEXT)");
+    $p->exec("CREATE TABLE IF NOT EXISTS goods_received_notes(id TEXT PRIMARY KEY, grn_number TEXT, po_id TEXT, received_date TEXT, received_by TEXT, notes TEXT, status TEXT DEFAULT 'Received', created_at TEXT DEFAULT(datetime('now')))");
+    ensure_arap_tables(); ensure_col('ap_bills', 'po_id');
+}
+function api_purchase_orders_list(): void {
+    ensure_proc_tables(); require_auth();
+    send(['ok' => true, 'purchase_orders' => db()->query("SELECT * FROM purchase_orders ORDER BY created_at DESC")->fetchAll()]);
+}
+function api_save_purchase_order(): void {
+    ensure_proc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $pid = $d['id'] ?? uuid4(); $num = $d['po_number'] ?? seq_code('purchase_orders', 'po_number', 'PO-', 4);
+    $lines = (isset($d['lines']) && is_array($d['lines'])) ? $d['lines'] : [];
+    $total = 0.0; foreach ($lines as $l) $total += (float)($l['total_ghs'] ?? ((float)($l['quantity'] ?? 0) * (float)($l['unit_price_ghs'] ?? 0)));
+    if ($total <= 0) $total = (float)($d['total_amount_ghs'] ?? 0);
+    $total = round($total, 2);
+    $ex = db()->prepare('SELECT id FROM purchase_orders WHERE id=?'); $ex->execute([$pid]);
+    if ($ex->fetchColumn()) {
+        db()->prepare("UPDATE purchase_orders SET vendor_name=?,vendor_id=?,project_id=?,po_date=?,delivery_date=?,total_amount_ghs=?,currency=?,status=?,terms=?,notes=? WHERE id=?")
+            ->execute([$d['vendor_name'] ?? '', $d['vendor_id'] ?? null, $d['project_id'] ?? null, $d['po_date'] ?? date('Y-m-d'), $d['delivery_date'] ?? null, $total, $d['currency'] ?? 'GHS', $d['status'] ?? 'Draft', $d['terms'] ?? null, $d['notes'] ?? null, $pid]);
+    } else {
+        db()->prepare("INSERT INTO purchase_orders(id,po_number,pr_id,vendor_id,vendor_name,project_id,po_date,delivery_date,total_amount_ghs,currency,status,terms,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$pid, $num, $d['pr_id'] ?? null, $d['vendor_id'] ?? null, $d['vendor_name'] ?? '', $d['project_id'] ?? null, $d['po_date'] ?? date('Y-m-d'), $d['delivery_date'] ?? null, $total, $d['currency'] ?? 'GHS', $d['status'] ?? 'Draft', $d['terms'] ?? null, $d['notes'] ?? null, $u['username']]);
+    }
+    db()->prepare("DELETE FROM po_line_items WHERE po_id=?")->execute([$pid]);
+    $ins = db()->prepare("INSERT INTO po_line_items(id,po_id,description,quantity,unit,unit_price_ghs,total_ghs,coa_code,coa_id) VALUES(?,?,?,?,?,?,?,?,?)");
+    foreach ($lines as $l) { $lt = round((float)($l['total_ghs'] ?? ((float)($l['quantity'] ?? 0) * (float)($l['unit_price_ghs'] ?? 0))), 2); $ins->execute([uuid4(), $pid, $l['description'] ?? '', (float)($l['quantity'] ?? 0), $l['unit'] ?? null, (float)($l['unit_price_ghs'] ?? 0), $lt, $l['coa_code'] ?? null, $l['coa_id'] ?? null]); }
+    ok(['id' => $pid, 'po_number' => $num, 'total' => $total]);
+}
+function api_save_grn(): void {
+    ensure_proc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $gid = $d['id'] ?? uuid4(); $num = $d['grn_number'] ?? seq_code('goods_received_notes', 'grn_number', 'GRN-', 4);
+    db()->prepare("INSERT INTO goods_received_notes(id,grn_number,po_id,received_date,received_by,notes,status) VALUES(?,?,?,?,?,?,?)")
+        ->execute([$gid, $num, $d['po_id'] ?? null, $d['received_date'] ?? date('Y-m-d'), $d['received_by'] ?? $u['username'], $d['notes'] ?? null, $d['status'] ?? 'Received']);
+    if (!empty($d['po_id'])) db()->prepare("UPDATE purchase_orders SET status='Received' WHERE id=?")->execute([$d['po_id']]);
+    ok(['id' => $gid, 'grn_number' => $num]);
+}
+function api_three_way_match(): void {
+    ensure_proc_tables(); require_auth();
+    $out = []; $counts = ['matched' => 0, 'received_unbilled' => 0, 'billed_no_grn' => 0, 'ordered' => 0, 'variance' => 0];
+    foreach (db()->query("SELECT * FROM purchase_orders ORDER BY created_at DESC")->fetchAll() as $po) {
+        $ordered = round((float)($po['total_amount_ghs'] ?? 0), 2);
+        $g = db()->prepare("SELECT grn_number, received_date FROM goods_received_notes WHERE po_id=? ORDER BY received_date DESC LIMIT 1"); $g->execute([$po['id']]); $grn = $g->fetch();
+        $received = (bool)$grn;
+        $bq = db()->prepare("SELECT COALESCE(SUM(total_ghs),0) FROM ap_bills WHERE po_id=?"); $bq->execute([$po['id']]); $billed = round((float)$bq->fetchColumn(), 2);
+        $variance = round($billed - $ordered, 2);
+        if ($billed > 0 && $received && abs($variance) < 0.01) { $status = 'Matched'; $counts['matched']++; }
+        elseif ($billed > 0 && !$received) { $status = 'Billed, no GRN'; $counts['billed_no_grn']++; }
+        elseif ($billed > 0 && abs($variance) >= 0.01) { $status = 'Variance'; $counts['variance']++; }
+        elseif ($received && $billed == 0) { $status = 'Received, not billed'; $counts['received_unbilled']++; }
+        else { $status = 'Ordered'; $counts['ordered']++; }
+        $out[] = ['po_id' => $po['id'], 'po_number' => $po['po_number'], 'vendor_name' => $po['vendor_name'], 'po_date' => $po['po_date'],
+            'ordered' => $ordered, 'received' => $received, 'grn_number' => ($grn['grn_number'] ?? ''), 'received_date' => ($grn['received_date'] ?? ''),
+            'billed' => $billed, 'variance' => $variance, 'status' => $status, 'po_status' => $po['status']];
+    }
+    ok(['rows' => $out, 'counts' => $counts, 'count' => count($out)]);
+}
+function api_po_to_bill(): void {
+    ensure_proc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $poId = (string)($d['po_id'] ?? ''); if ($poId === '') err('Select a purchase order');
+    $pq = db()->prepare("SELECT * FROM purchase_orders WHERE id=?"); $pq->execute([$poId]); $po = $pq->fetch();
+    if (!$po) err('Purchase order not found');
+    $exq = db()->prepare("SELECT id FROM ap_bills WHERE po_id=?"); $exq->execute([$poId]);
+    if ($exq->fetchColumn() && empty($d['force'])) err('A bill already exists for ' . ($po['po_number'] ?? '') . '. Use the AP module to view it.');
+    $vname = trim((string)($po['vendor_name'] ?? '')); $vid = null;
+    if ($vname !== '') { $vq = db()->prepare("SELECT id FROM vendors WHERE LOWER(vendor_name)=?"); $vq->execute([strtolower($vname)]); $vid = $vq->fetchColumn() ?: null; }
+    if (!$vid && !empty($po['vendor_id'])) { $vq = db()->prepare("SELECT id FROM vendors WHERE id=?"); $vq->execute([$po['vendor_id']]); $vid = $vq->fetchColumn() ?: null; }
+    if (!$vid) { $vid = uuid4(); db()->prepare("INSERT INTO vendors(id,vendor_code,vendor_name,vendor_type,created_by) VALUES(?,?,?,'Supplier',?)")->execute([$vid, seq_code('vendors', 'vendor_code', 'VEND-', 5), $vname ?: 'PO Vendor', $u['username']]); }
+    $dft = $d['expense_coa_id'] ?? (db()->query("SELECT id FROM chart_of_accounts WHERE code='61300001'")->fetchColumn() ?: (db()->query("SELECT id FROM chart_of_accounts WHERE code LIKE '6%' ORDER BY code LIMIT 1")->fetchColumn() ?: null));
+    $plq = db()->prepare("SELECT * FROM po_line_items WHERE po_id=?"); $plq->execute([$poId]); $plines = $plq->fetchAll();
+    $lines = [];
+    foreach ($plines as $l) { $amt = round((float)($l['total_ghs'] ?? ((float)($l['quantity'] ?? 0) * (float)($l['unit_price_ghs'] ?? 0))), 2); if ($amt <= 0) continue; $lines[] = ['coa_id' => $l['coa_id'] ?: $dft, 'amount_ghs' => $amt, 'description' => $l['description'] ?: $po['po_number']]; }
+    if (!$lines) { $tot = round((float)($po['total_amount_ghs'] ?? 0), 2); if ($tot <= 0) err('PO has no line amounts to bill'); $lines = [['coa_id' => $dft, 'amount_ghs' => $tot, 'description' => 'Goods/services per ' . ($po['po_number'] ?? '')]]; }
+    $total = round(array_sum(array_map(fn($l) => $l['amount_ghs'], $lines)), 2);
+    $bid = uuid4(); $num = seq_code('ap_bills', 'bill_number', 'BILL-', 4);
+    $bdate = $d['bill_date'] ?? date('Y-m-d'); $ddate = $d['due_date'] ?? $bdate;
+    db()->prepare("INSERT INTO ap_bills(id,bill_number,vendor_invoice_no,vendor_id,bill_date,due_date,project_id,expense_coa_id,description,amount_ghs,tax_ghs,total_ghs,amount_paid,status,created_by,po_id) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,0,'Draft',?,?)")
+        ->execute([$bid, $num, $po['po_number'] ?? '', $vid, $bdate, $ddate, $po['project_id'] ?? null, $lines[0]['coa_id'], 'Bill for ' . ($po['po_number'] ?? ''), $total, $total, $u['username'], $poId]);
+    $bl = db()->prepare("INSERT INTO ap_bill_lines(id,bill_id,line_number,description,expense_coa_id,amount_ghs) VALUES(?,?,?,?,?,?)");
+    $i = 0; foreach ($lines as $l) { $i++; $bl->execute([uuid4(), $bid, $i, $l['description'], $l['coa_id'], $l['amount_ghs']]); }
+    db()->prepare("UPDATE purchase_orders SET status='Billed' WHERE id=?")->execute([$poId]);
+    $jvnum = null;
+    if (!empty($d['post'])) {
+        $ap = ap_control_coa();
+        if ($ap) {
+            $jl = []; foreach ($lines as $l) $jl[] = ['coa_id' => $l['coa_id'], 'debit_amount' => $l['amount_ghs'], 'credit_amount' => 0, 'description' => $l['description'], 'project_id' => $po['project_id'] ?? null];
+            $jl[] = ['coa_id' => $ap['id'], 'debit_amount' => 0, 'credit_amount' => $total, 'description' => 'Bill ' . $num, 'project_id' => $po['project_id'] ?? null];
+            try { [$jid, $jvnum] = post_journal($u, 'JV', $bdate, substr($bdate, 0, 7), 'AP Bill ' . $num, $jl, 'ap_bills', $bid, null);
+                db()->prepare("UPDATE ap_bills SET status='Posted', jv_id=?, jv_number=?, posted_at=datetime('now') WHERE id=?")->execute([$jid, $jvnum, $bid]); }
+            catch (Throwable $e) { /* leave Draft */ }
+        }
+    }
+    ok(['id' => $bid, 'bill_number' => $num, 'total' => $total, 'jv_number' => $jvnum,
+        'message' => 'Created bill ' . $num . ' for ' . ($po['po_number'] ?? '') . ' (GHS ' . number_format($total, 2) . ')' . ($jvnum ? ' — posted ' . $jvnum : ' as draft')]);
+}
+function api_inv_reorder(): void {
+    ensure_inv_tables(); require_auth();
+    $out = [];
+    foreach (db()->query("SELECT * FROM inv_items WHERE COALESCE(reorder_level,0) > 0 AND COALESCE(qty_on_hand,0) <= reorder_level ORDER BY (reorder_level - qty_on_hand) DESC")->fetchAll() as $r) {
+        $roll = round((float)($r['reorder_level'] ?? 0), 2); $onhand = round((float)($r['qty_on_hand'] ?? 0), 2); $cost = round((float)($r['avg_cost'] ?? 0), 2);
+        $suggested = round(max($roll * 2 - $onhand, $roll), 2);
+        $out[] = ['id' => $r['id'], 'item_code' => $r['item_code'], 'item_name' => $r['item_name'], 'unit' => $r['unit'] ?: 'each',
+            'qty_on_hand' => $onhand, 'reorder_level' => $roll, 'avg_cost' => $cost, 'suggested_qty' => $suggested, 'est_cost' => round($suggested * $cost, 2)];
+    }
+    ok(['items' => $out, 'count' => count($out), 'total_est' => round(array_sum(array_map(fn($x) => $x['est_cost'], $out)), 2)]);
+}
+function api_inv_create_reorder_po(): void {
+    ensure_proc_tables(); ensure_inv_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $items = (isset($d['items']) && is_array($d['items'])) ? $d['items'] : [];
+    if (!$items) err('Select at least one item to reorder');
+    $lines = []; $total = 0.0;
+    foreach ($items as $it) {
+        $iid = $it['item_id'] ?? ($it['id'] ?? null); $qty = round((float)($it['qty'] ?? 0), 2); if ($qty <= 0) continue;
+        $rq = db()->prepare("SELECT * FROM inv_items WHERE id=?"); $rq->execute([$iid]); $row = $rq->fetch(); if (!$row) continue;
+        $cost = round((float)($row['avg_cost'] ?? 0), 2); $lt = round($qty * $cost, 2);
+        $lines[] = ['desc' => $row['item_name'], 'qty' => $qty, 'unit' => $row['unit'] ?: 'each', 'price' => $cost, 'total' => $lt, 'coa_id' => $row['inventory_coa_id']]; $total += $lt;
+    }
+    if (!$lines) err('No valid items/quantities to order');
+    $total = round($total, 2); $pid = uuid4(); $num = seq_code('purchase_orders', 'po_number', 'PO-', 4);
+    db()->prepare("INSERT INTO purchase_orders(id,po_number,vendor_name,po_date,total_amount_ghs,currency,status,notes,created_by) VALUES(?,?,?,?,?,'GHS','Draft',?,?)")
+        ->execute([$pid, $num, ($d['vendor_name'] ?? 'Stock reorder'), date('Y-m-d'), $total, 'Auto-raised from inventory reorder', $u['username']]);
+    $ins = db()->prepare("INSERT INTO po_line_items(id,po_id,description,quantity,unit,unit_price_ghs,total_ghs,coa_id) VALUES(?,?,?,?,?,?,?,?)");
+    foreach ($lines as $l) $ins->execute([uuid4(), $pid, $l['desc'], $l['qty'], $l['unit'], $l['price'], $l['total'], $l['coa_id']]);
+    ok(['po_id' => $pid, 'po_number' => $num, 'total' => $total, 'lines' => count($lines),
+        'message' => 'Draft ' . $num . ' raised for ' . count($lines) . ' item(s), GHS ' . number_format($total, 2) . '.']);
+}
+
 // One-click external-audit bundle: a ZIP (base64) of CSV schedules + a manifest.
 // Every section is best-effort and GL/table-derived; a failed section is reported
 // in the manifest, never kills the pack.
@@ -2623,9 +2753,9 @@ function api_inv_item_save(): void {
     if (empty($d['item_name'])) err('item_name is required');
     require_write_unit($u, $d, 'inventory item');
     $id = uuid4(); $code = $d['item_code'] ?? seq_code('inv_items', 'item_code', 'ITM-', 4);
-    db()->prepare('INSERT INTO inv_items(id,item_code,item_name,category,unit,inventory_coa_id,expense_coa_id,qty_on_hand,avg_cost,created_by) VALUES(?,?,?,?,?,?,?,0,0,?)')
+    db()->prepare('INSERT INTO inv_items(id,item_code,item_name,category,unit,reorder_level,inventory_coa_id,expense_coa_id,qty_on_hand,avg_cost,created_by) VALUES(?,?,?,?,?,?,?,?,0,0,?)')
         ->execute([$id, $code, $d['item_name'], $d['category'] ?? 'General', $d['unit'] ?? 'each',
-            $d['inventory_coa_id'] ?? inv_asset_coa(), $d['expense_coa_id'] ?? null, $u['username']]);
+            round((float)($d['reorder_level'] ?? 0), 2), $d['inventory_coa_id'] ?? inv_asset_coa(), $d['expense_coa_id'] ?? null, $u['username']]);
     ok(['id' => $id, 'item_code' => $code]);
 }
 function _inv_item(string $id): ?array { $st = db()->prepare('SELECT * FROM inv_items WHERE id=?'); $st->execute([$id]); return $st->fetch() ?: null; }
@@ -3727,6 +3857,13 @@ try {
     if ($path === '/api/bank-reconciliation-statement' && $method === 'POST') api_bank_recon_statement_save();
     if ($path === '/api/inv/import' && $method === 'POST') api_inv_import();
     if ($path === '/api/fuel-stock-health' && $method === 'GET') api_fuel_stock_health();
+    if ($path === '/api/purchase-orders' && $method === 'GET') api_purchase_orders_list();
+    if ($path === '/api/purchase-orders' && $method === 'POST') api_save_purchase_order();
+    if ($path === '/api/grns' && $method === 'POST') api_save_grn();
+    if ($path === '/api/three-way-match' && $method === 'GET') api_three_way_match();
+    if ($path === '/api/po-to-bill' && $method === 'POST') api_po_to_bill();
+    if ($path === '/api/inv/reorder' && $method === 'GET') api_inv_reorder();
+    if ($path === '/api/inv/reorder-po' && $method === 'POST') api_inv_create_reorder_po();
     if ($path === '/api/audit-pack' && $method === 'GET') api_audit_pack();
     if ($path === '/api/audit/verify' && $method === 'GET') api_audit_verify();
     if ($path === '/api/bank-recon/worklist' && $method === 'GET') api_bank_recon_worklist();
