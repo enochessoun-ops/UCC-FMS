@@ -372,6 +372,15 @@ function default_unit_id(): ?string {
 // system/university posters always resolve to Central and are never blocked.
 function resolve_write_unit(array $user, ?array $d = null): ?string {
     $explicit = $d['unit_id'] ?? null;
+    // Honour a unit *code* (or an id passed in the code field) — the SPA posting forms
+    // send unit_code/unit, and without this admin-entered transactions silently fell back
+    // to the Central root, mis-tagging every per-unit/segment report.
+    if (!$explicit) {
+        $codeval = $d['unit_code'] ?? ($d['unit'] ?? null);
+        if (!empty($codeval)) {
+            try { $st = db()->prepare('SELECT id FROM org_units WHERE id=? OR code=? LIMIT 1'); $st->execute([$codeval, $codeval]); $rid = $st->fetchColumn(); if ($rid) $explicit = $rid; } catch (Throwable $e) {}
+        }
+    }
     if ($explicit) return $explicit;
     $home = null; $scope = null;
     try {
@@ -1090,8 +1099,10 @@ function api_vendor_save(): void {
     ok(['id' => $id, 'vendor_code' => $code]);
 }
 function api_budgets_list(): void {
-    require_auth();
-    send(db()->query('SELECT * FROM budgets ORDER BY budget_code')->fetchAll());
+    $u = require_auth();
+    [$sw, $sp] = unit_scope_sql($u, 'b', $_GET['unit'] ?? null);
+    $st = db()->prepare("SELECT b.* FROM budgets b WHERE 1=1$sw ORDER BY b.budget_code"); $st->execute($sp);
+    send($st->fetchAll());
 }
 function api_budget_save(): void {
     require_role(['Admin', 'Finance Officer']);
@@ -1108,8 +1119,10 @@ function api_budget_save(): void {
     ok(['id' => $id, 'budget_code' => $code]);
 }
 function api_commitments_list(): void {
-    require_auth();
-    send(db()->query('SELECT * FROM commitments ORDER BY commit_code')->fetchAll());
+    $u = require_auth();
+    [$sw, $sp] = unit_scope_sql($u, 'c', $_GET['unit'] ?? null);
+    $st = db()->prepare("SELECT c.* FROM commitments c WHERE 1=1$sw ORDER BY c.commit_code"); $st->execute($sp);
+    send($st->fetchAll());
 }
 function api_commitment_save(): void {
     $u = require_role(['Admin', 'Finance Officer', 'Project Leader']);
@@ -1544,8 +1557,10 @@ function api_jv_workflow(): void {
 // (Payroll PAYE/SSNIT and fuel are deferred — a large, tax-critical port.)
 // ════════════════════════════════════════════════════════════════════════════
 function api_assets_list(): void {
-    require_auth();
-    send(['ok' => true, 'assets' => db()->query('SELECT * FROM asset_register ORDER BY asset_code')->fetchAll()]);
+    $u = require_auth();
+    [$sw, $sp] = unit_scope_sql($u, 'a', $_GET['unit'] ?? null);
+    $st = db()->prepare("SELECT a.* FROM asset_register a WHERE 1=1$sw ORDER BY a.asset_code"); $st->execute($sp);
+    send(['ok' => true, 'assets' => $st->fetchAll()]);
 }
 function api_asset_save(): void {
     $u = require_role(['Admin', 'Finance Officer']);
@@ -2602,8 +2617,12 @@ function api_payroll_months(): void {
     catch (Throwable $e) { send([]); }
 }
 function api_payroll_employees_list(): void {
-    require_auth();
-    try { send(db()->query("SELECT * FROM employees ORDER BY full_name")->fetchAll()); } catch (Throwable $e) { send([]); }
+    $u = require_auth();
+    try {
+        [$sw, $sp] = unit_scope_sql($u, 'e', $_GET['unit'] ?? null);
+        $st = db()->prepare("SELECT e.* FROM employees e WHERE 1=1$sw ORDER BY e.full_name"); $st->execute($sp);
+        send($st->fetchAll());
+    } catch (Throwable $e) { send([]); }
 }
 function api_payroll_settings_get(): void {
     require_auth();
@@ -2613,9 +2632,12 @@ function api_payroll_settings_get(): void {
     send(['settings' => $settings, 'bands' => $bands]);
 }
 function api_quarterly_budgets_list(): void {
-    require_auth();
-    try { send(db()->query("SELECT qb.*, c.account_name, c.code AS account_code FROM quarterly_budgets qb LEFT JOIN chart_of_accounts c ON qb.coa_id=c.id ORDER BY qb.created_at DESC")->fetchAll()); }
-    catch (Throwable $e) { send([]); }
+    $u = require_auth();
+    try {
+        [$sw, $sp] = unit_scope_sql($u, 'qb', $_GET['unit'] ?? null);
+        $st = db()->prepare("SELECT qb.*, c.account_name, c.code AS account_code FROM quarterly_budgets qb LEFT JOIN chart_of_accounts c ON qb.coa_id=c.id WHERE 1=1$sw ORDER BY qb.created_at DESC"); $st->execute($sp);
+        send($st->fetchAll());
+    } catch (Throwable $e) { send([]); }
 }
 function api_budget_periods_list(): void {
     require_auth();
@@ -2779,22 +2801,24 @@ function api_export_file(): void {
 // Month-end flash pack — GL-derived dashboard: SFP totals, period/YTD income &
 // expenditure, trial-balance health, and top expenditure lines for the period.
 function api_flash_pack(): void {
-    require_auth();
+    $u = require_auth();
     $period = trim((string)($_GET['period'] ?? ''));
     if ($period === '') { $r = db()->query("SELECT period FROM general_ledger ORDER BY period DESC LIMIT 1")->fetchColumn(); $period = $r ?: date('Y-m'); }
     $year = substr($period, 0, 4);
-    $sc = function (string $sql, array $p = []) { try { $st = db()->prepare($sql); $st->execute($p); $v = $st->fetchColumn(); return ($v === false || $v === null) ? 0.0 : round((float)$v, 2); } catch (Throwable $e) { return 0.0; } };
-    $assets = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '1%'");
-    $liab = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '2%'");
-    $funds = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '3%'");
-    $inc_p = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '4%' AND period LIKE ?", [$period . '%']);
-    $exp_p = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '6%' AND period LIKE ?", [$period . '%']);
-    $inc_y = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '4%' AND period LIKE ?", [$year . '%']);
-    $exp_y = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '6%' AND period LIKE ?", [$year . '%']);
-    $tb_dr = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)),0) FROM general_ledger");
-    $tb_cr = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)),0) FROM general_ledger");
+    // Unit scope: admin/university → whole institution; a unit user → own subtree only.
+    [$gw, $gp] = gl_scope_sql($u, $_GET['unit'] ?? null);
+    $sc = function (string $sql, array $p = []) use ($gp) { try { $st = db()->prepare($sql); $st->execute(array_merge($p, $gp)); $v = $st->fetchColumn(); return ($v === false || $v === null) ? 0.0 : round((float)$v, 2); } catch (Throwable $e) { return 0.0; } };
+    $assets = $sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '1%'$gw");
+    $liab = $sc("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '2%'$gw");
+    $funds = $sc("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '3%'$gw");
+    $inc_p = $sc("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '4%' AND gl.period LIKE ?$gw", [$period . '%']);
+    $exp_p = $sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '6%' AND gl.period LIKE ?$gw", [$period . '%']);
+    $inc_y = $sc("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)-COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '4%' AND gl.period LIKE ?$gw", [$year . '%']);
+    $exp_y = $sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '6%' AND gl.period LIKE ?$gw", [$year . '%']);
+    $tb_dr = $sc("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)),0) FROM general_ledger gl WHERE 1=1$gw");
+    $tb_cr = $sc("SELECT COALESCE(SUM(COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE 1=1$gw");
     $top = [];
-    try { foreach (db()->query("SELECT coa_code, MAX(account_name) AS account_name, ROUND(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),2) AS amount FROM general_ledger WHERE coa_code LIKE '6%' AND period LIKE '" . str_replace("'", "''", $period) . "%' GROUP BY coa_code HAVING amount > 0 ORDER BY amount DESC LIMIT 5")->fetchAll() as $r) $top[] = $r; } catch (Throwable $e) {}
+    try { $tst = db()->prepare("SELECT gl.coa_code, MAX(gl.account_name) AS account_name, ROUND(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),2) AS amount FROM general_ledger gl WHERE gl.coa_code LIKE '6%' AND gl.period LIKE ?$gw GROUP BY gl.coa_code HAVING amount > 0 ORDER BY amount DESC LIMIT 5"); $tst->execute(array_merge([$period . '%'], $gp)); foreach ($tst->fetchAll() as $r) $top[] = $r; } catch (Throwable $e) {}
     ok(['period' => $period, 'year' => $year, 'as_of' => date('Y-m-d'),
         'sfp' => ['assets' => $assets, 'liabilities' => $liab, 'funds_and_reserves' => $funds, 'net_assets' => round($assets - $liab, 2),
                   'presentation_difference' => round($assets - $liab - $funds + round($inc_y - $exp_y, 2), 2)],
@@ -2940,8 +2964,10 @@ function ensure_proc_tables(): void {
     ensure_arap_tables(); ensure_col('ap_bills', 'po_id');
 }
 function api_purchase_orders_list(): void {
-    ensure_proc_tables(); require_auth();
-    send(['ok' => true, 'purchase_orders' => db()->query("SELECT * FROM purchase_orders ORDER BY created_at DESC")->fetchAll()]);
+    ensure_proc_tables(); $u = require_auth();
+    [$sw, $sp] = unit_scope_sql($u, 'po', $_GET['unit'] ?? null);
+    $st = db()->prepare("SELECT po.* FROM purchase_orders po WHERE 1=1$sw ORDER BY po.created_at DESC"); $st->execute($sp);
+    send(['ok' => true, 'purchase_orders' => $st->fetchAll()]);
 }
 function api_save_purchase_order(): void {
     ensure_proc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
@@ -3242,8 +3268,14 @@ function resolve_read_scope(array $u, ?string $node): ?array {
         $code = $chk->fetchColumn() ?: $node;
         $ids = org_subtree_ids($code); return $ids ?: ['__none__'];
     }
-    $r = db()->prepare('SELECT home_unit_id, scope FROM users WHERE username=?'); $r->execute([$u['username']]); $row = $r->fetch();
-    $scope = $row['scope'] ?? 'university'; $home = $row['home_unit_id'] ?? null;
+    // Admin always sees the whole institution. For everyone else, fail CLOSED on any
+    // lookup error or missing record (no silent unrestricted access).
+    if (($u['role'] ?? '') === 'Admin') return null;
+    try {
+        $r = db()->prepare('SELECT home_unit_id, scope FROM users WHERE username=?'); $r->execute([$u['username'] ?? '']); $row = $r->fetch();
+    } catch (Throwable $e) { return ['__none__']; }
+    if (!$row) return ['__none__'];
+    $scope = $row['scope'] ?? null; $home = $row['home_unit_id'] ?? null;
     if ($scope === 'university') return null;
     if (!$home) return ['__none__'];
     $hc = db()->prepare('SELECT code FROM org_units WHERE id=?'); $hc->execute([$home]); $hcode = $hc->fetchColumn();
@@ -4654,11 +4686,17 @@ function api_opening_balances_list(): void {
 // Command-centre roll-up. total_committed is the OPEN encumbrance: each live
 // commitment's amount less posted actuals charged to it (mirror server.py).
 function api_dashboard(): void {
-    require_auth();
-    $tc = round((float)(db()->query("SELECT COALESCE(SUM(MAX(0, cmt.amount_ghs - COALESCE((SELECT SUM(ax.amount_ghs) FROM actuals ax WHERE ax.commitment_id=cmt.id AND COALESCE(ax.is_posted,0)=1),0))),0) FROM commitments cmt WHERE COALESCE(cmt.status,'') NOT IN ('Cancelled','Fully Paid')")->fetchColumn() ?: 0), 2);
-    $tb = round((float)(db()->query("SELECT COALESCE(SUM(budget_ghs),0) FROM budgets WHERE COALESCE(is_deleted,0)=0")->fetchColumn() ?: 0), 2);
-    $ts = round((float)(db()->query("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE COALESCE(is_posted,0)=1")->fetchColumn() ?: 0), 2);
-    $tr = 0.0; try { $tr = round((float)(db()->query("SELECT COALESCE(SUM(amount_ghs),0) FROM fund_receipts WHERE COALESCE(is_posted,0)=1")->fetchColumn() ?: 0), 2); } catch (Throwable $e) {}
+    $u = require_auth();
+    $node = $_GET['unit'] ?? null; // Admin/university → unrestricted; unit user → own subtree.
+    [$cw, $cp] = unit_scope_sql($u, 'cmt', $node);
+    [$bw, $bp] = unit_scope_sql($u, 'b', $node);
+    [$aw, $ap] = unit_scope_sql($u, 'a', $node);
+    [$rw, $rp] = unit_scope_sql($u, 'fr', $node);
+    $q = function (string $sql, array $p): float { try { $st = db()->prepare($sql); $st->execute($p); return round((float)($st->fetchColumn() ?: 0), 2); } catch (Throwable $e) { return 0.0; } };
+    $tc = $q("SELECT COALESCE(SUM(MAX(0, cmt.amount_ghs - COALESCE((SELECT SUM(ax.amount_ghs) FROM actuals ax WHERE ax.commitment_id=cmt.id AND COALESCE(ax.is_posted,0)=1),0))),0) FROM commitments cmt WHERE COALESCE(cmt.status,'') NOT IN ('Cancelled','Fully Paid')$cw", $cp);
+    $tb = $q("SELECT COALESCE(SUM(b.budget_ghs),0) FROM budgets b WHERE COALESCE(b.is_deleted,0)=0$bw", $bp);
+    $ts = $q("SELECT COALESCE(SUM(a.amount_ghs),0) FROM actuals a WHERE COALESCE(a.is_posted,0)=1$aw", $ap);
+    $tr = $q("SELECT COALESCE(SUM(fr.amount_ghs),0) FROM fund_receipts fr WHERE COALESCE(fr.is_posted,0)=1$rw", $rp);
     $stats = ['total_committed' => $tc, 'total_budget' => $tb, 'total_spent' => $ts, 'total_received' => $tr];
     ok(array_merge($stats, ['stats' => $stats]));
 }
