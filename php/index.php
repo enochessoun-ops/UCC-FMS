@@ -2148,6 +2148,60 @@ function api_procure_to_pay(): void {
         send($rows);
     } catch (Throwable $e) { send([]); }
 }
+// ── More SPA-view feeds (browser QA): bare-array lists + fuel object shape. ──
+function api_audit_log_list(): void {
+    require_auth();
+    try { send(db()->query("SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 200")->fetchAll()); } catch (Throwable $e) { send([]); }
+}
+function api_payroll_months(): void {
+    require_auth();
+    try { send(db()->query("SELECT payroll_month, status, COUNT(*) AS emp_count, SUM(gross_pay) AS total_gross, SUM(net_pay) AS total_net, SUM(paye) AS total_paye, SUM(employee_tier1) AS total_ssnit, SUM(total_employer_cost) AS total_cost FROM payroll_register GROUP BY payroll_month, status ORDER BY payroll_month DESC")->fetchAll()); }
+    catch (Throwable $e) { send([]); }
+}
+function api_payroll_employees_list(): void {
+    require_auth();
+    try { send(db()->query("SELECT * FROM employees ORDER BY full_name")->fetchAll()); } catch (Throwable $e) { send([]); }
+}
+function api_payroll_settings_get(): void {
+    require_auth();
+    $settings = []; $bands = [];
+    try { $settings = db()->query("SELECT * FROM payroll_settings ORDER BY key")->fetchAll(); } catch (Throwable $e) {}
+    try { if (function_exists('paye_bands')) $bands = paye_bands(); } catch (Throwable $e) { $bands = []; }
+    send(['settings' => $settings, 'bands' => $bands]);
+}
+function api_quarterly_budgets_list(): void {
+    require_auth();
+    try { send(db()->query("SELECT qb.*, c.account_name, c.code AS account_code FROM quarterly_budgets qb LEFT JOIN chart_of_accounts c ON qb.coa_id=c.id ORDER BY qb.created_at DESC")->fetchAll()); }
+    catch (Throwable $e) { send([]); }
+}
+function api_budget_periods_list(): void {
+    require_auth();
+    try { send(db()->query("SELECT * FROM budget_periods ORDER BY start_date")->fetchAll()); } catch (Throwable $e) { send([]); }
+}
+function api_budget_uploads_list(): void {
+    require_auth();
+    try { send(db()->query("SELECT * FROM budget_uploads ORDER BY created_at DESC LIMIT 50")->fetchAll()); } catch (Throwable $e) { send([]); }
+}
+// /api/fuel-coupons — the fuel view reads resp.summary.balance + resp.batches/movements
+// (an OBJECT, not a bare array). Mirror server.py api_fuel.
+function api_fuel_coupons(): void {
+    require_auth();
+    try {
+        $batches = db()->query("SELECT * FROM fuel_coupon_batches ORDER BY procurement_date DESC")->fetchAll();
+        $movements = []; try { $movements = db()->query("SELECT fm.*, fb.batch_number FROM fuel_coupon_movements fm LEFT JOIN fuel_coupon_batches fb ON fm.batch_id=fb.id ORDER BY fm.movement_date DESC, fm.created_at DESC LIMIT 300")->fetchAll(); } catch (Throwable $e) {}
+        $sv = function ($sql) { try { return round((float)(db()->query($sql)->fetchColumn() ?: 0), 2); } catch (Throwable $e) { return 0.0; } };
+        $fc_in = $sv("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_batches");
+        $borrow = $sv("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_movements WHERE movement_type='Borrow'");
+        $issued = $sv("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_movements WHERE movement_type='Issue'");
+        $lent = $sv("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_movements WHERE movement_type='Lend'");
+        $returned = $sv("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_movements WHERE movement_type IN ('Return','Return-Issued','Return-Lent','Return-Borrowed')");
+        $out_lent = $sv("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_movements WHERE movement_type='Lend' AND returned_date IS NULL");
+        $balance = round($fc_in + $borrow - $issued - $lent + $returned, 2);
+        $proj = []; try { $proj = db()->query("SELECT p.id, p.title AS name, p.project_code, COALESCE(SUM(CASE WHEN fm.movement_type='Issue' THEN fm.face_value ELSE 0 END),0) AS issued, COALESCE(SUM(CASE WHEN fm.movement_type IN ('Return','Return-Issued') THEN fm.face_value ELSE 0 END),0) AS returned FROM projects p LEFT JOIN fuel_coupon_movements fm ON p.id=fm.project_id GROUP BY p.id HAVING issued>0 ORDER BY p.title")->fetchAll(); } catch (Throwable $e) {}
+        send(['ok' => true, 'batches' => $batches, 'movements' => $movements, 'project_balances' => $proj,
+            'summary' => ['balance' => $balance, 'procured' => $fc_in, 'borrowed' => $borrow, 'issued' => $issued, 'lent' => $lent, 'returned' => $returned, 'out_lent' => $out_lent]]);
+    } catch (Throwable $e) { send(['ok' => true, 'batches' => [], 'movements' => [], 'project_balances' => [], 'summary' => ['balance' => 0]]); }
+}
 function api_save_rec_journal(): void {
     ensure_recjv(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
     $name = trim((string)($d['name'] ?? '')); if ($name === '') err('Template name is required');
@@ -4091,6 +4145,15 @@ try {
     if ($path === '/api/fuel-vehicles' && $method === 'GET') api_fuel_vehicles_list();
     if ($path === '/api/attachments' && $method === 'GET') api_attachments_list();
     if ($path === '/api/procure-to-pay' && $method === 'GET') api_procure_to_pay();
+    if ($path === '/api/fuel-coupons' && $method === 'GET') api_fuel_coupons();
+    if (($path === '/api/fx-rates') && $method === 'GET') api_exchange_rates();
+    if ($path === '/api/audit' && $method === 'GET') api_audit_log_list();
+    if ($path === '/api/payroll/months' && $method === 'GET') api_payroll_months();
+    if ($path === '/api/payroll/employees' && $method === 'GET') api_payroll_employees_list();
+    if ($path === '/api/payroll/settings' && $method === 'GET') api_payroll_settings_get();
+    if ($path === '/api/quarterly-budgets' && $method === 'GET') api_quarterly_budgets_list();
+    if ($path === '/api/budget-periods' && $method === 'GET') api_budget_periods_list();
+    if ($path === '/api/budget-uploads' && $method === 'GET') api_budget_uploads_list();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
