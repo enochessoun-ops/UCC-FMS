@@ -287,14 +287,16 @@ body {
   box-shadow:0 1px 3px rgba(0,0,0,0.04);
   display:flex;align-items:center;gap:12px;
   padding:0 24px;flex-shrink:0;
-  position:relative;
+  position:relative;overflow:hidden;flex-wrap:nowrap;
 }
 .tb-menu {
   background:none;border:none;color:var(--n400);font-size:18px;
   cursor:pointer;padding:6px;border-radius:7px;line-height:1;transition:var(--tr);
 }
 .tb-menu:hover { background:var(--n100);color:var(--n600); }
-.tb-title { font-size:15px;font-weight:700;color:var(--n800);flex:1;letter-spacing:-0.3px; }
+.tb-title { font-size:15px;font-weight:700;color:var(--n800);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-0.3px; }
+.tb-unit-chip { display:none;align-items:center;gap:4px;font-size:11px;font-weight:700;color:var(--accent,#2563EB);background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.18);padding:3px 10px;border-radius:99px;white-space:nowrap;flex-shrink:0;max-width:220px;overflow:hidden;text-overflow:ellipsis; }
+body.dark-mode .tb-unit-chip { color:#93C5FD;background:rgba(147,197,253,0.12);border-color:rgba(147,197,253,0.25); }
 .tb-srch { position:relative; }
 .tb-srch-ic { position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--n400);font-size:13px;pointer-events:none; }
 #search-box {
@@ -1753,6 +1755,7 @@ hr, .divider { border: none !important; border-top: 1px solid var(--s-bd) !impor
     <div id="topbar">
       <button class="tb-menu" onclick="toggleSidebar()">&#9776;</button>
       <div class="tb-title" id="tbt">Dashboard</div>
+      <span id="tb-unit" class="tb-unit-chip" title="Your active unit scope"></span>
       <span id="tb-save-ind" style="display:none;font-size:11px;font-weight:600;color:var(--green);background:#F0FDF4;padding:2px 10px;border-radius:99px;border:1px solid #BBF7D0;transition:opacity .3s">✓ Saved</span>
       <div class="tb-srch">
         <span class="tb-srch-ic">&#128269;</span>
@@ -1924,8 +1927,10 @@ function updateUserUI(){
   GET('/api/bank-accounts').then(function(accts){if(accts)S.cache.bankAccounts=accts;});
   GET('/api/projects').then(function(ps){if(ps)S.cache.projects=ps;});
   GET('/api/budgets').then(function(bs){if(bs)S.cache.budgets=bs;});
-  // Pre-load the org-unit tree so every form's unit/cost-centre picker is populated.
-  GET('/api/org-units').then(function(o){if(o)S.cache.orgUnits=o;});
+  // Pre-load the org-unit tree so every form's unit/cost-centre picker is populated,
+  // then show the active-unit context chip in the header ("where am I" for federated users).
+  GET('/api/org-units').then(function(o){if(o)S.cache.orgUnits=o; if(typeof refreshUnitChip==='function')refreshUnitChip();});
+  if(typeof refreshUnitChip==='function')refreshUnitChip();
   // Demo mode banner
   var banner=document.getElementById('demo-banner');
   if(u.username==='demo'){
@@ -2064,7 +2069,7 @@ async function vDash(){
   <div class="dash-hero">
     <div>
       <div class="dash-hero-title">Good ${now.getHours()<12?'Morning':now.getHours()<17?'Afternoon':'Evening'}, ${S.user?.full_name?.split(' ')[0]||'Admin'} 👋</div>
-      <div class="dash-hero-sub">University of Cape Coast · Ghana · CANS &nbsp;·&nbsp; ${now.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div>
+      <div class="dash-hero-sub">University of Cape Coast · Ghana · ${esc(activeUnitLabel())} &nbsp;·&nbsp; ${now.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div>
       <div class="sbs-academic-pill">📅 ${academicYear} Academic Year · ${sem}</div>
     </div>
     <div class="dash-funder-row">
@@ -7632,6 +7637,18 @@ async function editJV(jvId) {
 
 // Build <option> list for an org-unit (value=org_units.id). Falls back to the
 // legacy college codes only if the org_units cache is empty.
+// Active org-unit label for the current user (header chip + dashboard hero). Admin /
+// university scope = "All Units"; otherwise the home unit's name (federated "where am I").
+function activeUnitLabel(){
+  try{
+    var u=(window.S&&S.user)||{};
+    if((u.role==='Admin')||(u.scope==='university')||!u.home_unit_id) return 'All Units';
+    var raw=(S.cache&&S.cache.orgUnits)||[]; var list=Array.isArray(raw)?raw:(raw.units||[]);
+    var m=list.find(function(o){return o.id===u.home_unit_id;});
+    return m?(m.name||m.code):'My Unit';
+  }catch(e){ return 'All Units'; }
+}
+function refreshUnitChip(){ try{ var el=document.getElementById('tb-unit'); if(!el)return; el.textContent='🏛 '+activeUnitLabel(); el.style.display='inline-flex'; }catch(e){} }
 function _jvUnitOptions(selectedId){
   const raw = (S.cache && S.cache.orgUnits) || [];
   const list = Array.isArray(raw) ? raw : (raw.units || []);
