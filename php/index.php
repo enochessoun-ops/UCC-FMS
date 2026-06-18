@@ -2259,6 +2259,82 @@ function queue_email(string $to, string $subject, string $bodytext): string {
     return $eid;
 }
 function smtp_configured(): bool { return trim((string)getenv('SMTP_HOST')) !== ''; }
+// Minimal SMTP client so the SMTP_* env vars genuinely send via an external relay —
+// PHP's mail() ignores SMTP auth on Linux. Supports STARTTLS (587) and implicit TLS
+// (465) with AUTH LOGIN; falls back to mail() (cPanel local MTA) when SMTP_HOST is
+// unset. Returns ['ok'=>bool,'transport'=>..,'error'=>..]. Plain-text body.
+function smtp_send(string $to, string $subject, string $body): array {
+    $host = trim((string)getenv('SMTP_HOST'));
+    $from = trim((string)getenv('SMTP_FROM')) ?: (trim((string)getenv('SMTP_USER')) ?: ('no-reply@' . ($_SERVER['SERVER_NAME'] ?? 'ucc.local')));
+    if ($host === '') {
+        $headers = "From: $from\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n";
+        $ok = @mail($to, $subject, $body, $headers);
+        return ['ok' => (bool)$ok, 'transport' => 'mail()', 'error' => $ok ? '' : 'PHP mail() returned false (check the server MTA).'];
+    }
+    $port = (int)(getenv('SMTP_PORT') ?: 587);
+    $user = trim((string)getenv('SMTP_USER'));
+    $pass = (string)getenv('SMTP_PASSWORD');
+    $useTls = ($port === 587) || trim((string)getenv('SMTP_TLS')) === '1';
+    $useSsl = ($port === 465) || strtolower(trim((string)getenv('SMTP_SSL'))) === '1';
+    $errno = 0; $errstr = '';
+    $fp = @stream_socket_client(($useSsl ? 'ssl://' : '') . $host . ':' . $port, $errno, $errstr, 15);
+    if (!$fp) return ['ok' => false, 'transport' => 'smtp', 'error' => "connect failed: $errstr ($errno)"];
+    stream_set_timeout($fp, 15);
+    $read = function () use ($fp): array {
+        $data = '';
+        while (($line = fgets($fp, 515)) !== false) { $data .= $line; if (strlen($line) >= 4 && $line[3] === ' ') break; }
+        return [(int)substr($data, 0, 3), $data];
+    };
+    $cmd = function (string $c) use ($fp, $read): array { fwrite($fp, $c . "\r\n"); return $read(); };
+    [$code] = $read(); if ($code !== 220) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "greeting $code"]; }
+    $ehlo = $_SERVER['SERVER_NAME'] ?? 'ucc-fms';
+    $cmd("EHLO $ehlo");
+    if ($useTls) {
+        [$tc] = $cmd("STARTTLS"); if ($tc !== 220) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "STARTTLS $tc"]; }
+        if (!@stream_socket_enable_crypto($fp, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => 'TLS handshake failed']; }
+        $cmd("EHLO $ehlo");
+    }
+    if ($user !== '') {
+        [$ac] = $cmd("AUTH LOGIN"); if ($ac !== 334) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "AUTH $ac"]; }
+        $cmd(base64_encode($user));
+        [$pc] = $cmd(base64_encode($pass)); if ($pc !== 235) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "auth rejected $pc"]; }
+    }
+    [$mc] = $cmd("MAIL FROM:<$from>"); if ($mc !== 250) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "MAIL FROM $mc"]; }
+    [$rc] = $cmd("RCPT TO:<$to>"); if ($rc !== 250 && $rc !== 251) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "RCPT TO $rc"]; }
+    [$dc] = $cmd("DATA"); if ($dc !== 354) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "DATA $dc"]; }
+    $hdr = "Date: " . date('r') . "\r\nFrom: $from\r\nTo: $to\r\nSubject: " . str_replace(["\r", "\n"], '', $subject) . "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n";
+    $safe = preg_replace('/^\./m', '..', str_replace(["\r\n", "\r", "\n"], "\r\n", $body)); // dot-stuffing
+    [$ec] = $cmd($hdr . "\r\n" . $safe . "\r\n.");
+    if ($ec !== 250) { fclose($fp); return ['ok' => false, 'transport' => 'smtp', 'error' => "send rejected $ec"]; }
+    $cmd("QUIT"); fclose($fp);
+    return ['ok' => true, 'transport' => 'smtp', 'error' => ''];
+}
+// POST /api/email/test {to} — admin self-service check that the SMTP_* env vars work.
+function api_email_test(): void {
+    $u = require_role(['Admin']);
+    $d = body(); $to = trim((string)($d['to'] ?? ($u['email'] ?? '')));
+    if ($to === '' || !filter_var($to, FILTER_VALIDATE_EMAIL)) err('A valid "to" email address is required.');
+    if (!smtp_configured()) err('SMTP is not configured. Set SMTP_HOST/PORT/USER/PASSWORD/FROM on the server first.');
+    $res = smtp_send($to, 'UCC FMS — SMTP test', "This is a test message from UCC FMS confirming your SMTP configuration works.\r\n\r\nSent " . date('r') . ".");
+    ensure_email_outbox();
+    db()->prepare("INSERT INTO email_outbox(id,to_email,subject,body,status,error,sent_at) VALUES(?,?,?,?,?,?,?)")
+        ->execute([uuid4(), $to, 'UCC FMS — SMTP test', 'SMTP self-test', $res['ok'] ? 'Sent' : 'Failed', $res['error'], $res['ok'] ? date('Y-m-d H:i:s') : null]);
+    if (!$res['ok']) err('SMTP test failed via ' . $res['transport'] . ': ' . $res['error']);
+    ok(['sent' => true, 'transport' => $res['transport'], 'to' => $to]);
+}
+// POST /api/email/flush — retry every queued message through the configured transport.
+function api_email_flush(): void {
+    require_role(['Admin']); ensure_email_outbox();
+    if (!smtp_configured()) err('SMTP is not configured; nothing to flush. Set SMTP_HOST/PORT/USER/PASSWORD/FROM first.');
+    $rows = db()->query("SELECT id,to_email,subject,body FROM email_outbox WHERE status NOT IN ('Sent') ORDER BY created_at LIMIT 100")->fetchAll();
+    $sent = 0; $failed = 0;
+    foreach ($rows as $r) {
+        $res = smtp_send((string)$r['to_email'], (string)$r['subject'], (string)$r['body']);
+        if ($res['ok']) { $sent++; db()->prepare("UPDATE email_outbox SET status='Sent', sent_at=datetime('now'), error='' WHERE id=?")->execute([$r['id']]); }
+        else { $failed++; db()->prepare("UPDATE email_outbox SET status='Failed', error=? WHERE id=?")->execute([$res['error'], $r['id']]); }
+    }
+    ok(['flushed' => count($rows), 'sent' => $sent, 'failed' => $failed]);
+}
 // GET /api/email/status — outbox + whether SMTP is wired (the Notifications view).
 function api_email_status(): void {
     require_auth(); ensure_email_outbox();
@@ -2395,9 +2471,10 @@ function build_and_queue_statement(string $typ, string $rid, ?string $overrideEm
         db()->prepare("UPDATE email_outbox SET status='Queued - SMTP not configured', error=? WHERE id=?")->execute(['Set SMTP_HOST/PORT/USER/PASSWORD/FROM to enable sending.', $eid]);
         return ['ok' => true, 'queued' => true, 'sent' => false, 'to' => $email, 'message' => 'Statement for ' . ($name ?: 'account') . ' queued to ' . $email . '. Configure SMTP to send automatically.'];
     }
-    // SMTP configured: best-effort send via PHP mail(); on failure stay queued (graceful).
-    $sent = @mail($email, $subject, $bodytext);
-    db()->prepare("UPDATE email_outbox SET status=?, sent_at=CASE WHEN ?='Sent' THEN datetime('now') ELSE NULL END WHERE id=?")->execute([$sent ? 'Sent' : 'Queued', $sent ? 'Sent' : 'Queued', $eid]);
+    // SMTP configured: send via the real SMTP client; on failure stay queued (graceful).
+    $res = smtp_send($email, $subject, $bodytext); $sent = $res['ok'];
+    db()->prepare("UPDATE email_outbox SET status=?, error=?, sent_at=CASE WHEN ?='Sent' THEN datetime('now') ELSE NULL END WHERE id=?")
+        ->execute([$sent ? 'Sent' : 'Queued', $res['error'], $sent ? 'Sent' : 'Queued', $eid]);
     return ['ok' => true, 'queued' => !$sent, 'sent' => (bool)$sent, 'to' => $email, 'message' => $sent ? ('Statement emailed to ' . $email) : ('Statement queued to ' . $email)];
 }
 function api_email_statement(): void {
@@ -5012,6 +5089,8 @@ try {
     if ($path === '/api/ap/import-bills' && $method === 'POST') api_ap_import_bills();
     if ($path === '/api/email-statement' && $method === 'POST') api_email_statement();
     if ($path === '/api/email/status' && $method === 'GET') api_email_status();
+    if ($path === '/api/email/test' && $method === 'POST') api_email_test();
+    if ($path === '/api/email/flush' && $method === 'POST') api_email_flush();
     if ($path === '/api/dunning-preview' && $method === 'GET') api_dunning_preview();
     if ($path === '/api/dunning-run' && $method === 'POST') api_dunning_run();
     if ($path === '/api/rec-journals' && $method === 'GET') api_rec_journals_list();

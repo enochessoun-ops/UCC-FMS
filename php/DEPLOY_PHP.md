@@ -52,6 +52,17 @@ The DB file and its directory must be **writable by the PHP/Apache user**
   never leak into a JSON response; check the PHP error log for diagnostics.
 - HTTPS only (cPanel AutoSSL). Passwords are PBKDF2/legacy-sha256 dual-verified.
 
+## Pre-flight check (run on the server after upload)
+A self-contained, read-only environment check ships at `php/preflight.php`. Run it once
+on the UCC server to confirm PHP, extensions, the DB path/permissions, WAL and SMTP are
+ready **before** going live:
+```bash
+php php/preflight.php            # CLI — exit 0 = ready, 1 = a critical FAIL to fix
+# or, temporarily, in a browser:  https://your-domain/php/preflight.php
+```
+It changes nothing. **Delete it (or deny it in `.htaccess`) once the deployment is
+verified** — it reveals environment details.
+
 ## First run / smoke check
 ```bash
 # from the repo root, locally:
@@ -61,6 +72,36 @@ python3 smoke_test.py     --base http://127.0.0.1:8421 --user admin --pass UCC@2
 python3 regression_fixes.py --base http://127.0.0.1:8421 --user admin --pass UCC@2024 --period 2026-06
 ```
 Expect `SMOKE TEST: 11/11` and `REGRESSION (finance fixes): 78/78`.
+
+## Email / SMTP (for statements, dunning and remittance notices)
+The app **queues** every outbound email to its `email_outbox` table and shows the queue
+at `/api/email/status` (the Notifications view). Email is fully functional with the app
+running; it just won't *send* until an SMTP relay is configured — until then messages sit
+in the outbox marked `Queued - SMTP not configured` (no errors, no data loss).
+
+To enable sending, set these environment variables on the server (cPanel "MultiPHP INI
+Editor" / `.user.ini`, or `SetEnv` in the vhost) and restart PHP:
+```
+SMTP_HOST=mail.ucc.edu.gh        # your relay host (required to enable sending)
+SMTP_PORT=587                    # 587 = STARTTLS (default), 465 = implicit TLS, 25 = plain
+SMTP_USER=finance@ucc.edu.gh     # relay username (omit for an unauthenticated internal relay)
+SMTP_PASSWORD=********            # relay password
+SMTP_FROM=finance@ucc.edu.gh     # envelope/header From address
+# optional: SMTP_TLS=1 forces STARTTLS on a non-587 port; SMTP_SSL=1 forces implicit TLS
+```
+The port speaks SMTP directly (EHLO → STARTTLS → AUTH LOGIN → MAIL/RCPT/DATA), so it works
+with an external authenticated relay — not just the local MTA. If `SMTP_HOST` is unset it
+falls back to PHP `mail()` (the cPanel local sendmail).
+
+**Verify it works** (Admin), without sending a real statement:
+```bash
+curl -s -X POST https://your-domain/api/email/test \
+     -H 'X-Session-ID: <admin-sid>' -H 'Content-Type: application/json' \
+     -d '{"to":"you@ucc.edu.gh"}'
+# {"ok":true,"sent":true,"transport":"smtp","to":"..."}  ← config works
+```
+After enabling SMTP, flush anything that queued earlier:
+`POST /api/email/flush` (Admin) → retries every un-sent outbox row through the relay.
 
 ## Parallel-run cut-over (recommended)
 1. Deploy PHP pointing `SBS_DB` at the **live** SQLite file the Python app uses.
