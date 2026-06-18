@@ -488,15 +488,18 @@ function api_jvs_create(): void {
             (string)($d['reference'] ?? ''), $d['project_id'] ?? null, 'GHS', 1.0, $tdr, $tcr,
             'Draft', $u['username'], 'manual', (string)($d['notes'] ?? ''), $unit]);
     $ins = db()->prepare("INSERT INTO jv_lines
-        (id,jv_id,line_number,coa_id,description,debit_amount,credit_amount,project_id)
-        VALUES(?,?,?,?,?,?,?,?)");
+        (id,jv_id,line_number,coa_id,description,debit_amount,credit_amount,project_id,unit_id)
+        VALUES(?,?,?,?,?,?,?,?,?)");
     $ln = 0;
     foreach ($lines as $l) {
         $ln++;
+        // Optional per-line unit (resolve a code to an id); NULL inherits the header unit.
+        $lu = null; $lc = $l['unit_id'] ?? ($l['unit_code'] ?? null);
+        if (!empty($lc)) { try { $q = db()->prepare('SELECT id FROM org_units WHERE id=? OR code=? LIMIT 1'); $q->execute([$lc, $lc]); $lu = $q->fetchColumn() ?: null; } catch (Throwable $e) {} }
         $ins->execute([uuid4(), $jid, $ln, $l['coa_id'],
             (string)($l['description'] ?? ($d['description'] ?? '')),
             money($l['debit_amount'] ?? 0), money($l['credit_amount'] ?? 0),
-            $l['project_id'] ?? ($d['project_id'] ?? null)]);
+            $l['project_id'] ?? ($d['project_id'] ?? null), $lu]);
     }
     ok(['id' => $jid, 'jv_number' => $jvnum]);
 }
@@ -557,10 +560,14 @@ function api_jv_post(): void {
          debit_amount,credit_amount,project_id,posted_by,unit_id)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     foreach ($lines as $l) {
+        // Per-line unit (falls back to the header unit) so a single balanced JV can
+        // straddle units — the basis for inter-unit clearing/reallocation. Normal
+        // single-unit JVs leave line unit_id NULL and inherit the header unit unchanged.
+        $lineUnit = !empty($l['unit_id']) ? $l['unit_id'] : ($jv['unit_id'] ?? null);
         $ins->execute([uuid4(), $jid, $jv['jv_number'], $l['id'], $jv['jv_date'], $jv['period'],
             $l['coa_id'], $l['cc'], $l['an'], (string)($l['description'] ?? ''),
             money($l['debit_amount'] ?? 0), money($l['credit_amount'] ?? 0),
-            $l['project_id'] ?? null, $u['username'], $jv['unit_id'] ?? null]);
+            $l['project_id'] ?? null, $u['username'], $lineUnit]);
     }
     db()->prepare("UPDATE journal_vouchers SET status='Posted', posted_by=?, posted_at=datetime('now') WHERE id=?")
         ->execute([$u['username'], $jid]);
@@ -4683,6 +4690,94 @@ function api_opening_balances_list(): void {
     send($rows);
 }
 
+// ── Inter-unit transfers (federated reallocation between org units) ────────────
+// One unit transfers budget/funds to another; on approval a BALANCED clearing JV is
+// posted with each leg stamped to its own org unit (Dr clearing@receiving /
+// Cr clearing@sending), so the reallocation appears in each unit's GL and statements.
+// Ports server.py's flow, which the SPA already calls but the PHP backend lacked.
+function interunit_clearing_coa(): ?string {
+    foreach (['12300004', '11401003'] as $code) {
+        try { $st = db()->prepare("SELECT id FROM chart_of_accounts WHERE code=? LIMIT 1"); $st->execute([$code]); $id = $st->fetchColumn(); if ($id) return $id; } catch (Throwable $e) {}
+    }
+    try { return db()->query("SELECT id FROM chart_of_accounts WHERE account_name LIKE '%learing%' OR account_name LIKE '%nter%nit%' ORDER BY code LIMIT 1")->fetchColumn() ?: null; } catch (Throwable $e) { return null; }
+}
+function org_unit_id_of(?string $codeOrId): ?string {
+    if (!$codeOrId) return null;
+    try { $st = db()->prepare('SELECT id FROM org_units WHERE id=? OR code=? LIMIT 1'); $st->execute([$codeOrId, $codeOrId]); return $st->fetchColumn() ?: null; } catch (Throwable $e) { return null; }
+}
+function ensure_interunit_table(): void {
+    db()->exec("CREATE TABLE IF NOT EXISTS interunit_transfers(id TEXT PRIMARY KEY, transfer_number TEXT, from_unit TEXT, to_unit TEXT, transfer_type TEXT, amount_ghs REAL, transfer_date TEXT, period_code TEXT, description TEXT, justification TEXT, from_coa_id TEXT, to_coa_id TEXT, status TEXT DEFAULT 'Pending', approved_by TEXT, approved_at TEXT, jv_id TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')), unit_id TEXT, from_unit_id TEXT, to_unit_id TEXT)");
+}
+function api_interunit_transfers_list(): void {
+    ensure_interunit_table(); $u = require_auth();
+    $rows = db()->query("SELECT t.*, fu.name AS from_unit_name, tu.name AS to_unit_name
+        FROM interunit_transfers t
+        LEFT JOIN org_units fu ON (fu.id=t.from_unit_id OR fu.code=t.from_unit)
+        LEFT JOIN org_units tu ON (tu.id=t.to_unit_id OR tu.code=t.to_unit)
+        ORDER BY t.created_at DESC")->fetchAll();
+    // Scope: a unit user sees transfers where their subtree is the sender or receiver.
+    $scope = resolve_read_scope($u, null);
+    if ($scope !== null) { $set = array_flip($scope); $rows = array_values(array_filter($rows, fn($r) => isset($set[$r['from_unit_id']]) || isset($set[$r['to_unit_id']]))); }
+    send($rows);
+}
+function api_interunit_transfer_save(): void {
+    ensure_interunit_table(); $u = require_role(['Admin', 'Finance Officer']);
+    $d = body();
+    $from = (string)($d['from_unit'] ?? ''); $to = (string)($d['to_unit'] ?? '');
+    $amt = money($d['amount_ghs'] ?? 0);
+    if ($from === '' || $to === '') err('From and To units are required.');
+    if ($amt <= 0) err('Amount must be positive.');
+    $fid = org_unit_id_of($from); $tid = org_unit_id_of($to);
+    if ($fid && $tid && $fid === $tid) err('From and To units must differ.');
+    $id = (string)($d['id'] ?? uuid4());
+    $cur = db()->prepare('SELECT status FROM interunit_transfers WHERE id=?'); $cur->execute([$id]);
+    if (($cur->fetchColumn() ?: '') === 'Approved') err('An approved transfer cannot be edited.');
+    $num = (string)($d['transfer_number'] ?? seq_code('interunit_transfers', 'transfer_number', 'IUT-', 4));
+    $date = (string)($d['transfer_date'] ?? date('Y-m-d'));
+    db()->prepare("INSERT INTO interunit_transfers(id,transfer_number,from_unit,to_unit,from_unit_id,to_unit_id,transfer_type,amount_ghs,transfer_date,period_code,description,justification,from_coa_id,to_coa_id,status,created_by)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET from_unit=excluded.from_unit,to_unit=excluded.to_unit,from_unit_id=excluded.from_unit_id,to_unit_id=excluded.to_unit_id,transfer_type=excluded.transfer_type,amount_ghs=excluded.amount_ghs,transfer_date=excluded.transfer_date,period_code=excluded.period_code,description=excluded.description,justification=excluded.justification")
+        ->execute([$id, $num, $from, $to, $fid, $tid, (string)($d['transfer_type'] ?? 'Budget'), $amt, $date,
+            (string)($d['period_code'] ?? substr($date, 0, 7)), (string)($d['description'] ?? ''), (string)($d['justification'] ?? ''),
+            $d['from_coa_id'] ?? null, $d['to_coa_id'] ?? null, 'Pending', $u['username']]);
+    ok(['id' => $id, 'transfer_number' => $num]);
+}
+function api_interunit_transfer_approve(): void {
+    ensure_interunit_table(); $u = require_role(['Admin']);
+    $d = body(); $id = (string)($d['id'] ?? '');
+    if ($id === '') err('Transfer id is required.');
+    $st = db()->prepare('SELECT * FROM interunit_transfers WHERE id=?'); $st->execute([$id]); $t = $st->fetch();
+    if (!$t) err('Transfer not found.', 404);
+    if (($t['status'] ?? '') === 'Approved') err('Transfer is already approved.');
+    $amt = round((float)($t['amount_ghs'] ?? 0), 2);
+    $fid = $t['from_unit_id'] ?: org_unit_id_of($t['from_unit']);
+    $tid = $t['to_unit_id'] ?: org_unit_id_of($t['to_unit']);
+    $clr = interunit_clearing_coa();
+    $jid = null;
+    if ($amt > 0 && $fid && $tid && $clr) {
+        $period = (string)($t['period_code'] ?? substr((string)($t['transfer_date'] ?? date('Y-m-d')), 0, 7));
+        $date = (string)($t['transfer_date'] ?? date('Y-m-d'));
+        $jid = uuid4();
+        $jvnum = seq_code('journal_vouchers', 'jv_number', 'IUT-' . substr($period, 0, 4) . '-', 4);
+        $desc = 'Inter-unit transfer ' . ($t['transfer_number'] ?? '') . ': ' . ($t['from_unit'] ?? '') . ' -> ' . ($t['to_unit'] ?? '');
+        db()->prepare("INSERT INTO journal_vouchers(id,jv_number,jv_type,jv_date,period,description,narration,currency,fx_rate,total_debit,total_credit,status,prepared_by,source_module,unit_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$jid, $jvnum, 'JV', $date, $period, $desc, (string)($t['justification'] ?? ''), 'GHS', 1.0, $amt, $amt, 'Draft', $u['username'], 'interunit', $tid]);
+        $li = db()->prepare("INSERT INTO jv_lines(id,jv_id,line_number,coa_id,description,debit_amount,credit_amount,unit_id) VALUES(?,?,?,?,?,?,?,?)");
+        $li->execute([uuid4(), $jid, 1, $clr, $desc . ' (receiving)', $amt, 0, $tid]); // Dr clearing @ receiving unit
+        $li->execute([uuid4(), $jid, 2, $clr, $desc . ' (sending)', 0, $amt, $fid]);   // Cr clearing @ sending unit
+        // Post inline (per-line unit stamped to GL), keeping api_jv_post untouched.
+        $ls = db()->prepare("SELECT l.*, c.code AS cc, c.account_name AS an FROM jv_lines l JOIN chart_of_accounts c ON c.id=l.coa_id WHERE l.jv_id=? ORDER BY l.line_number"); $ls->execute([$jid]);
+        $gl = db()->prepare("INSERT INTO general_ledger(id,jv_id,jv_number,jv_line_id,ledger_date,period,coa_id,coa_code,account_name,description,debit_amount,credit_amount,posted_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        foreach ($ls->fetchAll() as $l) $gl->execute([uuid4(), $jid, $jvnum, $l['id'], $date, $period, $l['coa_id'], $l['cc'], $l['an'], (string)$l['description'], money($l['debit_amount']), money($l['credit_amount']), $u['username'], $l['unit_id']]);
+        db()->prepare("UPDATE journal_vouchers SET status='Posted', posted_by=?, posted_at=datetime('now') WHERE id=?")->execute([$u['username'], $jid]);
+    }
+    db()->prepare("UPDATE interunit_transfers SET status='Approved', approved_by=?, approved_at=datetime('now'), jv_id=? WHERE id=?")
+        ->execute([$u['username'], $jid, $id]);
+    ok(['id' => $id, 'status' => 'Approved', 'jv_id' => $jid, 'posted' => $jid !== null,
+        'message' => $jid ? 'Approved; balanced inter-unit clearing JV posted per unit.' : 'Approved (no JV: units not mapped to org_units or clearing account missing).']);
+}
+
 // Command-centre roll-up. total_committed is the OPEN encumbrance: each live
 // commitment's amount less posted actuals charged to it (mirror server.py).
 function api_dashboard(): void {
@@ -5196,6 +5291,10 @@ try {
     if ($path === '/api/bank-reconciliations' && $method === 'GET') api_bank_reconciliations_list();
     if ($path === '/api/opening-balance-wizard' && $method === 'GET') api_opening_balance_wizard();
     if ($path === '/api/opening-balances/list' && $method === 'GET') api_opening_balances_list();
+    // Inter-unit transfers (federated reallocation; posts a per-unit clearing JV on approval).
+    if ($path === '/api/interunit-transfers' && $method === 'GET') api_interunit_transfers_list();
+    if ($path === '/api/interunit-transfers' && $method === 'POST') api_interunit_transfer_save();
+    if ($path === '/api/interunit-transfers/approve' && $method === 'POST') api_interunit_transfer_approve();
     // Governance / meta / readiness views (secondary, non-finance, read-only).
     if ($path === '/api/app-version' && $method === 'GET') api_app_version();
     if ($path === '/api/system-health' && $method === 'GET') api_system_health();
