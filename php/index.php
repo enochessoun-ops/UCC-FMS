@@ -1925,6 +1925,13 @@ function queue_email(string $to, string $subject, string $bodytext): string {
     return $eid;
 }
 function smtp_configured(): bool { return trim((string)getenv('SMTP_HOST')) !== ''; }
+// GET /api/email/status — outbox + whether SMTP is wired (the Notifications view).
+function api_email_status(): void {
+    require_auth(); ensure_email_outbox();
+    $rows = []; try { $rows = db()->query("SELECT * FROM email_outbox ORDER BY created_at DESC LIMIT 50")->fetchAll(); } catch (Throwable $e) {}
+    ok(['smtp_configured' => smtp_configured(), 'outbox' => $rows,
+        'required_env' => ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM']]);
+}
 
 // Parse a delimited file (csv_text, or base64 file_b64) into lc-keyed rows. Header
 // keys are lowercased with spaces/dashes -> underscores (mirror _cf_lc_row).
@@ -4245,6 +4252,7 @@ try {
     if ($path === '/api/ar/import-invoices' && $method === 'POST') api_ar_import_invoices();
     if ($path === '/api/ap/import-bills' && $method === 'POST') api_ap_import_bills();
     if ($path === '/api/email-statement' && $method === 'POST') api_email_statement();
+    if ($path === '/api/email/status' && $method === 'GET') api_email_status();
     if ($path === '/api/dunning-preview' && $method === 'GET') api_dunning_preview();
     if ($path === '/api/dunning-run' && $method === 'POST') api_dunning_run();
     if ($path === '/api/rec-journals' && $method === 'GET') api_rec_journals_list();
