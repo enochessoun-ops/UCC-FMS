@@ -1600,6 +1600,8 @@ function ensure_pc_tables(): void {
     $p->exec("CREATE TABLE IF NOT EXISTS petty_cash_vouchers (id TEXT PRIMARY KEY, float_id TEXT NOT NULL, pcv_number TEXT, voucher_date TEXT NOT NULL, payee TEXT NOT NULL, description TEXT DEFAULT '', expense_coa_id TEXT NOT NULL, amount_ghs REAL NOT NULL, receipt_ref TEXT DEFAULT '', status TEXT DEFAULT 'Posted', jv_id TEXT, jv_number TEXT, created_by TEXT, created_at TEXT DEFAULT (datetime('now')))");
     foreach (['department_code', 'project_id', 'unit_id'] as $c) ensure_col('petty_cash_floats', $c);
     ensure_col('petty_cash_vouchers', 'unit_id');
+    $p->exec("CREATE TABLE IF NOT EXISTS petty_cash_replenishments (id TEXT PRIMARY KEY, float_id TEXT, repl_date TEXT, amount_ghs REAL, jv_number TEXT, created_by TEXT, created_at TEXT DEFAULT (datetime('now')))");
+    $p->exec("CREATE TABLE IF NOT EXISTS petty_cash_voucher_lines (id TEXT PRIMARY KEY, voucher_id TEXT, line_no INTEGER, expense_coa_id TEXT, amount_ghs REAL, description TEXT)");
 }
 function pc2_imprest_coa(?string $coa_id): ?string {
     if ($coa_id) { $r = db()->prepare('SELECT id,code FROM chart_of_accounts WHERE id=?'); $r->execute([$coa_id]); $x = $r->fetch(); if ($x && (str_starts_with((string)$x['code'], '12') || $x['code'] === '1001')) return $x['id']; }
@@ -1611,15 +1613,27 @@ function pc2_imprest_coa(?string $coa_id): ?string {
 }
 function pc_book_balance(string $fid): float {
     $f = db()->prepare('SELECT imprest_amount FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $imp = (float)($f->fetchColumn() ?: 0);
-    $v = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM petty_cash_vouchers WHERE float_id=? AND status='Posted'"); $v->execute([$fid]); $sp = (float)$v->fetchColumn();
-    return round($imp - $sp, 2);
+    $v = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM petty_cash_vouchers WHERE float_id=? AND COALESCE(status,'Posted')='Posted'"); $v->execute([$fid]); $sp = (float)$v->fetchColumn();
+    // Cash on hand = imprest − unreplenished spend; replenishments draw cash back in.
+    $rp = 0.0; try { $rq = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM petty_cash_replenishments WHERE float_id=?"); $rq->execute([$fid]); $rp = (float)$rq->fetchColumn(); } catch (Throwable $e) {}
+    return round($imp - $sp + $rp, 2);
 }
 function api_pc2_state(): void {
     ensure_pc_tables(); require_auth();
     $floats = db()->query('SELECT * FROM petty_cash_floats ORDER BY created_at')->fetchAll();
-    foreach ($floats as &$f) $f['book_balance'] = pc_book_balance($f['id']);
+    $coas = [];
+    foreach ($floats as &$f) { $f['book_balance'] = pc_book_balance($f['id']); if (!empty($f['coa_id'])) $coas[$f['coa_id']] = true; }
     unset($f);
-    send(['ok' => true, 'floats' => $floats, 'vouchers' => db()->query('SELECT * FROM petty_cash_vouchers ORDER BY created_at DESC LIMIT 100')->fetchAll()]);
+    if ($coas) { $qm = implode(',', array_fill(0, count($coas), '?')); $g = db()->prepare("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_id IN ($qm)"); $g->execute(array_keys($coas)); $gl = round((float)$g->fetchColumn(), 2); }
+    else $gl = 0.0;
+    $tb = 0.0; foreach ($floats as $f) $tb += (float)$f['book_balance']; $tb = round($tb, 2);
+    // every official imprest GL account (129x family + any imprest/petty-named 12x) so any
+    // department can pick its own float account.
+    $imprest = db()->query("SELECT id, code, account_name FROM chart_of_accounts WHERE (code LIKE '129%' OR LOWER(account_name) LIKE '%imprest%' OR LOWER(account_name) LIKE '%petty%') AND code LIKE '12%' ORDER BY code")->fetchAll();
+    send(['ok' => true, 'floats' => $floats, 'gl_balance' => $gl, 'total_book_balance' => $tb,
+        'gl_tie_ok' => abs($gl - $tb) < 0.01, 'imprest_accounts' => $imprest,
+        'vouchers' => db()->query('SELECT * FROM petty_cash_vouchers ORDER BY created_at DESC LIMIT 100')->fetchAll(),
+        'replenishments' => db()->query('SELECT * FROM petty_cash_replenishments ORDER BY repl_date DESC LIMIT 30')->fetchAll()]);
 }
 function api_pc2_setup_float(): void {
     ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
@@ -1643,23 +1657,74 @@ function api_pc2_voucher(): void {
     ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
     $fid = (string)($d['float_id'] ?? ''); if ($fid === '') err('float_id is required');
     $payee = trim((string)($d['payee'] ?? '')); if ($payee === '') err('payee is required');
-    $exp = $d['expense_coa_id'] ?? null; $amt = round((float)($d['amount_ghs'] ?? 0), 2);
-    if (!$exp || $amt <= 0) err('expense_coa_id and amount_ghs (> 0) are required');
+    // Multi-line disbursement: split across several expense accounts (Dr each / Cr the
+    // float's imprest for the total). Backward-compatible with single expense_coa_id+amount.
+    $norm = [];
+    if (isset($d['lines']) && is_array($d['lines']) && $d['lines']) {
+        foreach ($d['lines'] as $ln) { $a = round((float)($ln['amount_ghs'] ?? ($ln['amount'] ?? 0)), 2); $coa = $ln['expense_coa_id'] ?? ($ln['coa_id'] ?? null); if ($a > 0 && $coa) $norm[] = ['coa_id' => $coa, 'amount' => $a, 'description' => trim((string)($ln['description'] ?? ''))]; }
+        if (!$norm) err('Add at least one expense line (account + amount > 0)');
+    } else {
+        $exp = $d['expense_coa_id'] ?? null; $a = round((float)($d['amount_ghs'] ?? 0), 2);
+        if (!$exp || $a <= 0) err('expense_coa_id and amount_ghs (> 0) are required');
+        $norm = [['coa_id' => $exp, 'amount' => $a, 'description' => trim((string)($d['description'] ?? ''))]];
+    }
+    $amt = round(array_sum(array_column($norm, 'amount')), 2);
     $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch();
     if (!$fl) err('Float not found');
     $bal = pc_book_balance($fid);
     if ($amt > $bal + 0.001) err(sprintf('Insufficient float balance: available GHS %.2f, voucher GHS %.2f. Replenish the float first.', $bal, $amt));
     $vdate = substr((string)($d['voucher_date'] ?? date('Y-m-d')), 0, 10);
-    $desc = 'Petty cash: ' . $payee . (($d['description'] ?? '') ? ' — ' . $d['description'] : '');
-    $lines = [['coa_id' => $exp, 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => $desc],
-              ['coa_id' => $fl['coa_id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Disbursed from float ' . $fl['name']]];
+    $lines = [];
+    foreach ($norm as $n) $lines[] = ['coa_id' => $n['coa_id'], 'debit_amount' => $n['amount'], 'credit_amount' => 0, 'description' => ($n['description'] ?: ('Petty cash: ' . $payee))];
+    $lines[] = ['coa_id' => $fl['coa_id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Disbursed from float ' . $fl['name']];
     $unit = ($fl['unit_id'] ?? null) ?: resolve_write_unit($u, $d);
-    try { [$jid, $jvnum] = post_journal($u, 'JV', $vdate, substr($vdate, 0, 7), $desc, $lines, 'petty_cash_voucher', $fid, $unit); }
+    try { [$jid, $jvnum] = post_journal($u, 'JV', $vdate, substr($vdate, 0, 7), 'Petty cash voucher — ' . $payee, $lines, 'petty_cash_voucher', $fid, $unit); }
     catch (Throwable $e) { err('Could not post the voucher: ' . $e->getMessage()); }
     $vid = uuid4(); $pcv = seq_code('petty_cash_vouchers', 'pcv_number', 'PCV-', 4);
     db()->prepare("INSERT INTO petty_cash_vouchers(id,float_id,pcv_number,voucher_date,payee,description,expense_coa_id,amount_ghs,status,jv_number,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,'Posted',?,?,?)")
-        ->execute([$vid, $fid, $pcv, $vdate, $payee, $d['description'] ?? '', $exp, $amt, $jvnum, $u['username'], $unit]);
-    ok(['id' => $vid, 'pcv_number' => $pcv, 'jv_number' => $jvnum, 'balance_after' => round($bal - $amt, 2)]);
+        ->execute([$vid, $fid, $pcv, $vdate, $payee, $d['description'] ?? '', $norm[0]['coa_id'], $amt, $jvnum, $u['username'], $unit]);
+    $ln = 0; $li = db()->prepare("INSERT INTO petty_cash_voucher_lines(id,voucher_id,line_no,expense_coa_id,amount_ghs,description) VALUES(?,?,?,?,?,?)");
+    foreach ($norm as $n) { $ln++; $li->execute([uuid4(), $vid, $ln, $n['coa_id'], $n['amount'], $n['description']]); }
+    ok(['id' => $vid, 'pcv_number' => $pcv, 'jv_number' => $jvnum, 'lines' => count($norm), 'total_ghs' => $amt, 'balance_after' => round($bal - $amt, 2)]);
+}
+function api_pc2_ledger(): void {
+    ensure_pc_tables(); require_auth();
+    $fid = (string)($_GET['float_id'] ?? ''); if ($fid === '') err('float_id is required');
+    $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch(); if (!$fl) err('Float not found');
+    $fl['book_balance'] = pc_book_balance($fid);
+    $vs = db()->prepare('SELECT * FROM petty_cash_vouchers WHERE float_id=? ORDER BY voucher_date, created_at'); $vs->execute([$fid]);
+    $rs = db()->prepare('SELECT * FROM petty_cash_replenishments WHERE float_id=? ORDER BY repl_date'); $rs->execute([$fid]);
+    ok(['float' => $fl, 'vouchers' => $vs->fetchAll(), 'replenishments' => $rs->fetchAll()]);
+}
+function api_pc2_replenish(): void {
+    ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $fid = (string)($d['float_id'] ?? ''); if ($fid === '') err('float_id is required');
+    $f = db()->prepare('SELECT * FROM petty_cash_floats WHERE id=?'); $f->execute([$fid]); $fl = $f->fetch(); if (!$fl) err('Float not found');
+    $book = pc_book_balance($fid); $topup = round((float)$fl['imprest_amount'] - $book, 2);
+    if ($topup <= 0.01) err('Float is already at its imprest level — nothing to replenish');
+    $bankc = bank_coa_from_account((string)($fl['bank_account_id'] ?? '')); if (!$bankc) { $b = operating_bank_coa(); $bankc = $b['id'] ?? null; }
+    if (!$bankc) err('Bank account could not be resolved');
+    $rdate = substr((string)($d['date'] ?? date('Y-m-d')), 0, 10);
+    $lines = [['coa_id' => $fl['coa_id'], 'debit_amount' => $topup, 'credit_amount' => 0, 'description' => 'Petty cash replenishment — ' . $fl['name']],
+              ['coa_id' => $bankc, 'debit_amount' => 0, 'credit_amount' => $topup, 'description' => 'Cash to replenish ' . $fl['name']]];
+    try { [$jid, $jvnum] = post_journal($u, 'JV', $rdate, substr($rdate, 0, 7), 'Petty cash replenishment — ' . $fl['name'], $lines, 'petty_cash_replenish', $fid, $fl['unit_id'] ?? null); }
+    catch (Throwable $e) { err('Could not post the replenishment: ' . $e->getMessage()); }
+    db()->prepare("INSERT INTO petty_cash_replenishments(id,float_id,repl_date,amount_ghs,jv_number,created_by) VALUES(?,?,?,?,?,?)")->execute([uuid4(), $fid, $rdate, $topup, $jvnum, $u['username']]);
+    ok(['jv_number' => $jvnum, 'amount' => $topup, 'book_balance' => pc_book_balance($fid)]);
+}
+function api_pc2_void(): void {
+    ensure_pc_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $vid = (string)($d['voucher_id'] ?? ($d['id'] ?? '')); if ($vid === '') err('voucher_id is required');
+    $v = db()->prepare('SELECT * FROM petty_cash_vouchers WHERE id=?'); $v->execute([$vid]); $vc = $v->fetch(); if (!$vc) err('Voucher not found');
+    if ((string)($vc['status'] ?? '') === 'Voided') err('Voucher already voided');
+    $g = db()->prepare('SELECT * FROM general_ledger WHERE jv_number=?'); $g->execute([$vc['jv_number']]); $rows = $g->fetchAll();
+    if ($rows) {
+        $rdate = (string)$vc['voucher_date']; $lines = [];
+        foreach ($rows as $r) $lines[] = ['coa_id' => $r['coa_id'], 'debit_amount' => money($r['credit_amount']), 'credit_amount' => money($r['debit_amount']), 'description' => 'Void PCV ' . (string)($vc['pcv_number'] ?? '')];
+        try { post_journal($u, 'JV', $rdate, substr($rdate, 0, 7), 'Void petty cash voucher ' . (string)($vc['pcv_number'] ?? ''), $lines, 'petty_cash_void', $vid, $vc['unit_id'] ?? null); } catch (Throwable $e) {}
+    }
+    db()->prepare("UPDATE petty_cash_vouchers SET status='Voided' WHERE id=?")->execute([$vid]);
+    ok(['voided' => $vid, 'book_balance' => pc_book_balance((string)$vc['float_id'])]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2321,6 +2386,9 @@ try {
     if ($path === '/api/petty-cash2' && $method === 'GET') api_pc2_state();
     if ($path === '/api/petty-cash2/float' && $method === 'POST') api_pc2_setup_float();
     if ($path === '/api/petty-cash2/voucher' && $method === 'POST') api_pc2_voucher();
+    if ($path === '/api/petty-cash2/replenish' && $method === 'POST') api_pc2_replenish();
+    if ($path === '/api/petty-cash2/voucher/void' && $method === 'POST') api_pc2_void();
+    if ($path === '/api/petty-cash2/ledger' && $method === 'GET') api_pc2_ledger();
 
     // Phase 3e — financial statements (GL-derived)
     if ($path === '/api/income-expenditure' && $method === 'GET') api_income_expenditure();
