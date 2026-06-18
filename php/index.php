@@ -2149,6 +2149,76 @@ function api_audit_pack(): void {
         'zip_b64' => base64_encode($data), 'filename' => "audit_pack_$fy.zip", 'bytes' => strlen($data)]);
 }
 
+// ── Tamper-evident audit log: recompute the SHA-256 hash chain and report
+//    integrity (mirror server.py _audit_row_hash / api_audit_verify).
+function audit_row_hash($prev, $aid, $ts, $uname, $role, $action, $module, $rec, $det): string {
+    $payload = implode('|', [(string)$prev, (string)$aid, (string)$ts, (string)$uname, (string)$role, (string)$action, (string)($module ?? ''), (string)($rec ?? ''), (string)($det ?? '')]);
+    return hash('sha256', $payload);
+}
+function api_audit_verify(): void {
+    $u = require_auth();
+    if (!in_array($u['role'] ?? '', ['Admin', 'Finance Officer', 'Auditor'], true)) err('Admin, Finance Officer or Auditor role required');
+    foreach (['row_hash', 'prev_hash', 'user_role'] as $c) ensure_col('audit_log', $c);
+    $rows = db()->query("SELECT id,timestamp,username,COALESCE(user_role,'') AS user_role,action,module,record_id,details,row_hash,prev_hash FROM audit_log ORDER BY timestamp ASC, rowid ASC")->fetchAll();
+    $total = count($rows); $checked = 0; $sealed = 0; $prev = 'GENESIS'; $first_broken = null;
+    $seal = db()->prepare("UPDATE audit_log SET row_hash=?, prev_hash=? WHERE id=?");
+    foreach ($rows as $r) {
+        if (empty($r['row_hash'])) {
+            // Legacy row predating chaining: seal it into the chain now (first verify
+            // acts as the tamper-evident baseline; later edits will break recompute).
+            $rh = audit_row_hash($prev, $r['id'], $r['timestamp'], $r['username'], $r['user_role'], $r['action'], $r['module'], $r['record_id'], $r['details']);
+            $seal->execute([$rh, $prev, $r['id']]); $sealed++; $checked++; $prev = $rh; continue;
+        }
+        $base = ($r['prev_hash'] === null || $r['prev_hash'] === '') ? $prev : $r['prev_hash'];
+        $expect = audit_row_hash($base, $r['id'], $r['timestamp'], $r['username'], $r['user_role'], $r['action'], $r['module'], $r['record_id'], $r['details']);
+        $link_ok = ($r['prev_hash'] === $prev) || ($prev === 'GENESIS' && in_array($r['prev_hash'], [null, '', 'GENESIS'], true));
+        if ($r['row_hash'] !== $expect || !$link_ok) { if (!$first_broken) $first_broken = ['id' => $r['id'], 'timestamp' => $r['timestamp'], 'action' => $r['action'], 'username' => $r['username'], 'reason' => $r['row_hash'] !== $expect ? 'content altered' : 'chain link broken']; }
+        $checked++; $prev = $r['row_hash'];
+    }
+    $intact = $first_broken === null;
+    ok(['verified' => $intact, 'total_entries' => $total, 'hash_chained' => $checked, 'sealed' => $sealed, 'first_broken' => $first_broken,
+        'message' => $intact ? "Audit chain intact — $checked hash-linked entries verified" : ('TAMPERING DETECTED at entry ' . substr((string)$first_broken['id'], 0, 8) . ' (' . $first_broken['reason'] . ')')]);
+}
+
+// ── Bank reconciliation — persistent clearing. Tick each cash-book line that has
+//    cleared the bank; the cleared state persists (bank_recon_cleared).
+function ensure_brc(): void {
+    db()->exec("CREATE TABLE IF NOT EXISTS bank_recon_cleared (gl_id TEXT PRIMARY KEY, bank_account_id TEXT, cleared_date TEXT, cleared_by TEXT, created_at TEXT DEFAULT (datetime('now')))");
+}
+function api_bank_recon_worklist(): void {
+    require_auth(); ensure_brc();
+    $bid = (string)($_GET['bank_account_id'] ?? ''); if ($bid === '') err('Select a bank account');
+    $asat = substr((string)($_GET['as_at'] ?? date('Y-m-d')), 0, 10);
+    $bk = db()->prepare("SELECT id, bank_name, account_number, coa_id FROM bank_accounts WHERE id=?"); $bk->execute([$bid]); $b = $bk->fetch();
+    if (!$b) err('Bank account not found');
+    if (empty($b['coa_id'])) err('This bank account has no linked GL account');
+    $clrst = db()->prepare("SELECT gl_id FROM bank_recon_cleared WHERE bank_account_id=?"); $clrst->execute([$bid]);
+    $cleared = array_flip(array_column($clrst->fetchAll(), 'gl_id'));
+    $st = db()->prepare("SELECT gl.id, gl.ledger_date, gl.jv_number, gl.description, COALESCE(gl.debit_amount,0) dr, COALESCE(gl.credit_amount,0) cr FROM general_ledger gl WHERE gl.coa_id=? AND gl.ledger_date<=? ORDER BY gl.ledger_date, gl.jv_number");
+    $st->execute([$b['coa_id'], $asat]);
+    $rows = []; $book = 0.0; $ct = 0.0; $ot = 0.0;
+    foreach ($st->fetchAll() as $r) {
+        $amt = round((float)$r['dr'] - (float)$r['cr'], 2); $isc = isset($cleared[$r['id']]); $book += $amt;
+        if ($isc) $ct += $amt; else $ot += $amt;
+        $rows[] = ['gl_id' => $r['id'], 'date' => $r['ledger_date'], 'voucher' => $r['jv_number'], 'description' => $r['description'], 'amount' => $amt, 'cleared' => $isc];
+    }
+    ok(['bank' => ['id' => $b['id'], 'name' => $b['bank_name'], 'account_number' => $b['account_number']], 'as_at' => $asat,
+        'lines' => $rows, 'book_balance' => round($book, 2), 'cleared_balance' => round($ct, 2), 'outstanding_total' => round($ot, 2),
+        'outstanding_count' => count(array_filter($rows, fn($x) => !$x['cleared']))]);
+}
+function api_bank_recon_clear(): void {
+    require_role(['Admin', 'Finance Officer']); ensure_brc(); $d = body();
+    $bid = (string)($d['bank_account_id'] ?? ''); if ($bid === '') err('bank_account_id is required');
+    $gl_ids = $d['gl_ids'] ?? []; if (!is_array($gl_ids) || !$gl_ids) err('Select at least one line');
+    $cleared = array_key_exists('cleared', $d) ? (bool)$d['cleared'] : true;
+    $cdate = substr((string)($d['cleared_date'] ?? date('Y-m-d')), 0, 10); $n = 0;
+    $ins = db()->prepare("INSERT OR REPLACE INTO bank_recon_cleared(gl_id,bank_account_id,cleared_date,cleared_by) VALUES(?,?,?,?)");
+    $del = db()->prepare("DELETE FROM bank_recon_cleared WHERE gl_id=?");
+    $uname = (current_user()['username'] ?? '');
+    foreach ($gl_ids as $gid) { if ($cleared) $ins->execute([$gid, $bid, $cdate, $uname]); else $del->execute([$gid]); $n++; }
+    ok(['updated' => $n, 'cleared' => $cleared, 'message' => "$n line(s) " . ($cleared ? 'cleared' : 'set outstanding')]);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE 3e — Financial statements derived from the general ledger: Income &
 // Expenditure, Statement of Financial Position, and Cash Flow. Mirrors the Python
@@ -2769,9 +2839,29 @@ function api_bank_account_save(): void {
             $d['account_type'] ?? 'Current', $d['currency'] ?? 'GHS', (float)($d['opening_balance'] ?? 0), $u['username']]);
     ok(['id' => $id]);
 }
+// The seed's users table carries a column-level CHECK limiting role to the three
+// operational roles. Widen it once (preserving all columns/data) so read-only roles
+// like Auditor can be provisioned. Idempotent: skips once 'Auditor' is in the DDL.
+function ensure_user_roles(): void {
+    $ddl = db()->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")->fetchColumn();
+    if (!$ddl || stripos($ddl, 'role IN') === false || stripos($ddl, 'Auditor') !== false) return;
+    $new = preg_replace_callback('/role\s+IN\s*\(([^)]*)\)/i', fn($m) => "role IN (" . $m[1] . ",'Auditor','Viewer','Internal Auditor','Read Only')", $ddl, 1);
+    if (!$new || $new === $ddl) return;
+    $newDDL = preg_replace('/CREATE TABLE\s+["`]?users["`]?/i', 'CREATE TABLE users__new', $new, 1);
+    if (!$newDDL || $newDDL === $new) return;
+    $cols = implode(',', array_map(fn($c) => $c['name'], db()->query("PRAGMA table_info(users)")->fetchAll()));
+    try {
+        db()->exec('PRAGMA foreign_keys=OFF');
+        db()->exec($newDDL);
+        db()->exec("INSERT INTO users__new ($cols) SELECT $cols FROM users");
+        db()->exec("DROP TABLE users");
+        db()->exec("ALTER TABLE users__new RENAME TO users");
+    } catch (Throwable $e) { /* leave the original table in place on any failure */ }
+}
 function api_user_create(): void {
     $u = require_role(['Admin']); $d = body();
     if (empty($d['username']) || empty($d['full_name']) || empty($d['role'])) err('username, full_name and role are required');
+    ensure_user_roles();
     if (empty($d['password'])) err('Password required for new user');
     $id = uuid4();
     ensure_col('users', 'home_unit_id'); ensure_col('users', 'scope');
@@ -3293,6 +3383,9 @@ try {
     if ($path === '/api/me'     && $method === 'GET')  api_me();
     if ($path === '/api/verify-mfa' && $method === 'POST') api_verify_mfa();
     if ($path === '/api/mfa/enroll' && $method === 'POST') api_mfa_enroll();
+    // Auditor accounts are strictly read-only: block every write (POST) past the auth
+    // endpoints with a clear message, while GET reports and exports stay available.
+    if ($method === 'POST') { $au = current_user(); if ($au && ($au['role'] ?? '') === 'Auditor') err('This account is read-only (Auditor) — writes are not permitted', 403); }
     if ($path === '/api/settings/dual-control' && $method === 'GET') api_dual_control_get();
     if ($path === '/api/settings/dual-control' && $method === 'POST') api_dual_control_set();
     if ($path === '/api/org-units' && $method === 'GET') api_org_units();
@@ -3417,6 +3510,9 @@ try {
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
     if ($path === '/api/export-file' && $method === 'POST') api_export_file();
     if ($path === '/api/audit-pack' && $method === 'GET') api_audit_pack();
+    if ($path === '/api/audit/verify' && $method === 'GET') api_audit_verify();
+    if ($path === '/api/bank-recon/worklist' && $method === 'GET') api_bank_recon_worklist();
+    if ($path === '/api/bank-recon/clear' && $method === 'POST') api_bank_recon_clear();
     if ($path === '/api/statutory-filings' && $method === 'GET') api_statutory_filings();
     if ($path === '/api/opening-balances/post' && $method === 'POST') api_opening_balances_post();
     if ($path === '/api/withholding-payables' && $method === 'GET') api_withholding_list();
