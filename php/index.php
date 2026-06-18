@@ -617,9 +617,10 @@ function api_vendor_save(): void {
     $id = uuid4();
     $code = $d['vendor_code'] ?? seq_code('vendors', 'vendor_code', 'VEN-', 4);
     ensure_col('vendors', 'tin'); ensure_col('vendors', 'vendor_type'); ensure_col('vendors', 'unit_id');
+    foreach (['bank_name', 'account_name', 'account_number', 'email', 'phone'] as $c) ensure_col('vendors', $c);
     $unit = resolve_write_unit($u, $d);
-    db()->prepare('INSERT INTO vendors(id,vendor_code,vendor_name,tin,vendor_type,unit_id) VALUES(?,?,?,?,?,?)')
-        ->execute([$id, $code, $d['vendor_name'], $d['tin'] ?? null, $d['vendor_type'] ?? 'Supplier', $unit]);
+    db()->prepare('INSERT INTO vendors(id,vendor_code,vendor_name,tin,vendor_type,bank_name,account_name,account_number,email,phone,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+        ->execute([$id, $code, $d['vendor_name'], $d['tin'] ?? null, $d['vendor_type'] ?? 'Supplier', $d['bank_name'] ?? null, $d['account_name'] ?? null, $d['account_number'] ?? null, $d['email'] ?? null, $d['phone'] ?? null, $unit]);
     ok(['id' => $id, 'vendor_code' => $code]);
 }
 function api_budgets_list(): void {
@@ -1117,6 +1118,8 @@ function ensure_arap_tables(): void {
     $p->exec("CREATE TABLE IF NOT EXISTS ar_invoice_lines(id TEXT PRIMARY KEY, invoice_id TEXT, line_number INTEGER, description TEXT, income_coa_id TEXT, amount_ghs REAL DEFAULT 0)");
     $p->exec("CREATE TABLE IF NOT EXISTS ap_bills(id TEXT PRIMARY KEY, bill_number TEXT, vendor_invoice_no TEXT, vendor_id TEXT, bill_date TEXT, due_date TEXT, project_id TEXT, expense_coa_id TEXT, description TEXT, amount_ghs REAL DEFAULT 0, tax_ghs REAL DEFAULT 0, total_ghs REAL DEFAULT 0, amount_paid REAL DEFAULT 0, status TEXT DEFAULT 'Draft', jv_id TEXT, jv_number TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')), posted_at TEXT)");
     $p->exec("CREATE TABLE IF NOT EXISTS ap_bill_lines(id TEXT PRIMARY KEY, bill_id TEXT, line_number INTEGER, description TEXT, expense_coa_id TEXT, amount_ghs REAL DEFAULT 0)");
+    $p->exec("CREATE TABLE IF NOT EXISTS ap_payments(id TEXT PRIMARY KEY, payment_number TEXT, bill_id TEXT, vendor_id TEXT, payment_date TEXT, amount_ghs REAL DEFAULT 0, bank_account_id TEXT, payment_method TEXT, reference TEXT, jv_id TEXT, jv_number TEXT, notes TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    $p->exec("CREATE TABLE IF NOT EXISTS ar_receipts(id TEXT PRIMARY KEY, receipt_number TEXT, invoice_id TEXT, customer_id TEXT, receipt_date TEXT, amount_ghs REAL DEFAULT 0, bank_account_id TEXT, payment_method TEXT, reference TEXT, jv_id TEXT, jv_number TEXT, notes TEXT, created_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
     ensure_col('ar_invoices', 'unit_id'); ensure_col('ap_bills', 'unit_id');
 }
 function ar_control_coa(): ?array {
@@ -1310,6 +1313,91 @@ function api_ap_payment(): void {
     $newpaid = round($paid + $amt, 2); $newbal = round($total - $newpaid, 2); $status = $newbal <= 0.01 ? 'Paid' : 'Part-Paid';
     db()->prepare('UPDATE ap_bills SET amount_paid=?, status=? WHERE id=?')->execute([$newpaid, $status, $bid]);
     ok(['jv_number' => $jvnum, 'status' => $status, 'balance_ghs' => $newbal, 'amount_paid' => $newpaid]);
+}
+
+// Pay several posted/part-paid bills in one PV (Dr Payables per bill, Cr Bank total),
+// record an ap_payments row per bill, and advance each bill's paid/status. Returns the
+// run's jv_number, which feeds the payment-run bank file below.
+function api_ap_batch_pay(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    ensure_col('ap_bills', 'amount_paid', 'REAL');
+    $items = (isset($d['items']) && is_array($d['items']) && $d['items']) ? $d['items']
+        : array_map(fn($b) => ['bill_id' => $b], (array)($d['bill_ids'] ?? []));
+    if (!$items) err('Select at least one bill to pay');
+    $bankId = (string)($d['bank_account_id'] ?? ''); if ($bankId === '') err('Select the bank account to pay from');
+    $bcoa = bank_coa_from_account($bankId); $ap = ap_control_coa();
+    if (!$bcoa || !$ap) err('Bank or payables control account could not be resolved');
+    $pdate = (string)($d['payment_date'] ?? date('Y-m-d'));
+    $ref = trim((string)($d['reference'] ?? '')) ?: ('Batch payment ' . $pdate);
+    $plans = []; $total = 0.0;
+    foreach ($items as $it) {
+        $bid = (string)($it['bill_id'] ?? ($it['id'] ?? '')); if ($bid === '') continue;
+        $st = db()->prepare('SELECT * FROM ap_bills WHERE id=?'); $st->execute([$bid]); $bill = $st->fetch();
+        if (!$bill) err('Bill not found: ' . $bid);
+        if (!in_array($bill['status'] ?? '', ['Posted', 'Part-Paid'], true)) continue;
+        $bal = round((float)$bill['total_ghs'] - (float)($bill['amount_paid'] ?? 0), 2);
+        $amt = isset($it['amount_ghs']) ? round((float)$it['amount_ghs'], 2) : $bal;
+        if ($amt <= 0) continue;
+        if ($amt > $bal + 0.01) err(sprintf('Payment GHS %.2f exceeds balance GHS %.2f on %s', $amt, $bal, $bill['bill_number']));
+        $plans[] = [$bill, $amt]; $total += $amt;
+    }
+    $total = round($total, 2);
+    if (!$plans) err('No payable bills selected (only posted/part-paid bills can be paid)');
+    $lines = [];
+    foreach ($plans as [$bill, $amt]) $lines[] = ['coa_id' => $ap['id'], 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => 'Payment ' . $bill['bill_number'], 'project_id' => $bill['project_id']];
+    $lines[] = ['coa_id' => $bcoa, 'debit_amount' => 0, 'credit_amount' => $total, 'description' => $ref, 'project_id' => null];
+    try { [$jid, $jvnum] = post_journal($u, 'PV', $pdate, substr($pdate, 0, 7), 'Batch supplier payment (' . count($plans) . ' bills)', $lines, 'ap_payments', 'batch', resolve_write_unit($u, $d)); }
+    catch (Throwable $e) { err('Could not post batch payment: ' . $e->getMessage()); }
+    $results = [];
+    $ins = db()->prepare('INSERT INTO ap_payments(id,payment_number,bill_id,vendor_id,payment_date,amount_ghs,bank_account_id,payment_method,reference,jv_id,jv_number,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    foreach ($plans as [$bill, $amt]) {
+        $pnum = seq_code('ap_payments', 'payment_number', 'APP-', 4);
+        $ins->execute([uuid4(), $pnum, $bill['id'], $bill['vendor_id'], $pdate, $amt, $bankId, 'Batch', $ref, $jid, $jvnum, 'batch', $u['username']]);
+        $newpaid = round((float)($bill['amount_paid'] ?? 0) + $amt, 2);
+        $status = $newpaid >= (float)$bill['total_ghs'] - 0.01 ? 'Paid' : 'Part-Paid';
+        db()->prepare('UPDATE ap_bills SET amount_paid=?, status=? WHERE id=?')->execute([$newpaid, $status, $bill['id']]);
+        $results[] = ['bill_number' => $bill['bill_number'], 'amount' => $amt, 'status' => $status];
+    }
+    ok(['count' => count($plans), 'total' => $total, 'jv_number' => $jvnum, 'results' => $results,
+        'message' => sprintf('Paid %d bill(s) as %s, total GHS %.2f', count($plans), $jvnum, $total)]);
+}
+
+// Bank transfer instruction for one payment run: per-vendor rows with bank details
+// from the vendor master + a bank-upload CSV (base64, UTF-8 BOM). Flags any vendor
+// missing bank_name/account_number so finance can complete the master first.
+function api_payment_run_file(): void {
+    ensure_arap_tables(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $jvn = trim((string)($d['jv_number'] ?? '')); if ($jvn === '') err('jv_number of the payment run is required');
+    foreach (['bank_name', 'account_name', 'account_number', 'email'] as $c) ensure_col('vendors', $c);
+    $st = db()->prepare(
+        "SELECT p.*, v.vendor_name, COALESCE(v.bank_name,'') AS v_bank, COALESCE(v.account_name,'') AS v_acct_name, " .
+        "COALESCE(v.account_number,'') AS v_acct_no, COALESCE(v.email,'') AS v_email, " .
+        "COALESCE(b.bill_number,'') AS bill_number, COALESCE(b.vendor_invoice_no,'') AS vendor_invoice_no " .
+        "FROM ap_payments p LEFT JOIN vendors v ON v.id=p.vendor_id " .
+        "LEFT JOIN ap_bills b ON b.id=p.bill_id WHERE p.jv_number=? ORDER BY v.vendor_name");
+    $st->execute([$jvn]); $pays = $st->fetchAll();
+    if (!$pays) err('No payments found for run ' . $jvn);
+    $byv = [];
+    foreach ($pays as $p) {
+        $vid = (string)($p['vendor_id'] ?? '');
+        if (!isset($byv[$vid])) $byv[$vid] = ['vendor_name' => $p['vendor_name'] ?: '(unknown vendor)',
+            'bank_name' => $p['v_bank'], 'account_name' => ($p['v_acct_name'] ?: $p['vendor_name']),
+            'account_number' => $p['v_acct_no'], 'email' => $p['v_email'], 'amount_ghs' => 0.0, 'bills' => []];
+        $byv[$vid]['amount_ghs'] = round($byv[$vid]['amount_ghs'] + (float)($p['amount_ghs'] ?? 0), 2);
+        $byv[$vid]['bills'][] = ['bill_number' => $p['bill_number'], 'vendor_invoice_no' => $p['vendor_invoice_no'],
+            'amount_ghs' => round((float)($p['amount_ghs'] ?? 0), 2), 'payment_number' => $p['payment_number']];
+    }
+    $rows = array_values($byv); usort($rows, fn($a, $b) => strcmp($a['vendor_name'], $b['vendor_name']));
+    $missing = []; foreach ($rows as $r) if (!($r['bank_name'] && $r['account_number'])) $missing[] = $r['vendor_name'];
+    $esc = fn($x) => '"' . str_replace('"', '""', (string)$x) . '"';
+    $csv = "Beneficiary Name,Bank,Account Name,Account Number,Amount (GHS),Narration\r\n";
+    foreach ($rows as $r) $csv .= implode(',', [$esc($r['vendor_name']), $esc($r['bank_name']), $esc($r['account_name']),
+        $esc($r['account_number']), $esc(number_format($r['amount_ghs'], 2, '.', '')), $esc('Payment run ' . $jvn)]) . "\r\n";
+    $csv_b64 = base64_encode("\xEF\xBB\xBF" . $csv);
+    $total = round(array_sum(array_map(fn($r) => $r['amount_ghs'], $rows)), 2);
+    ok(['jv_number' => $jvn, 'rows' => $rows, 'total_ghs' => $total, 'beneficiaries' => count($rows),
+        'csv_b64' => $csv_b64, 'filename' => 'bank_schedule_' . str_replace('/', '-', $jvn) . '.csv',
+        'missing_bank_details' => $missing, 'remittance_emailed' => 0]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2482,6 +2570,8 @@ try {
     if ($path === '/api/ap/bills' && $method === 'POST') api_ap_bill_save();
     if ($path === '/api/ap/bills/post' && $method === 'POST') api_ap_bill_post();
     if ($path === '/api/ap/payment' && $method === 'POST') api_ap_payment();
+    if ($path === '/api/ap/batch-pay' && $method === 'POST') api_ap_batch_pay();
+    if ($path === '/api/ap/payment-run-file' && $method === 'POST') api_payment_run_file();
 
     // Phase 3d (inventory) — stores ledger
     if ($path === '/api/inv/items' && $method === 'GET') api_inv_items_list();
