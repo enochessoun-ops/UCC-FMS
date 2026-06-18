@@ -236,7 +236,7 @@ function api_approvals_list(): void {
     $rows = db()->query("SELECT * FROM approvals ORDER BY submitted_at DESC")->fetchAll();
     foreach ($rows as &$r) { $s = db()->prepare("SELECT * FROM approval_steps WHERE approval_id=? ORDER BY step_order"); $s->execute([$r['id']]); $r['steps'] = $s->fetchAll(); }
     unset($r);
-    ok(['approvals' => $rows, 'rows' => $rows]);
+    send($rows); // BARE ARRAY (SPA does GET('/api/approvals')||[]; gate's as_list reads either)
 }
 function api_approvals_process(): void {
     ensure_approvals(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
@@ -714,7 +714,10 @@ function api_vendors_list(): void {
     $u = require_auth(); ensure_col('vendors', 'unit_id');
     [$sw, $sp] = unit_scope_sql($u, 'vendors', $_GET['unit'] ?? ($_GET['unit_code'] ?? null));
     $st = db()->prepare("SELECT vendors.* FROM vendors WHERE 1=1$sw ORDER BY vendor_name");
-    $st->execute($sp); send(['ok' => true, 'vendors' => $st->fetchAll()]);
+    // BARE ARRAY: the SPA does `await GET('/api/vendors')||[]` then .map for dropdowns
+    // (it was built against the Python backend, which returns a list). The gate's
+    // as_list() reads either shape.
+    $st->execute($sp); send($st->fetchAll());
 }
 function api_vendor_save(): void {
     $u = require_role(['Admin', 'Finance Officer']);
@@ -2089,6 +2092,61 @@ function api_rec_journals_list(): void {
         (SELECT COUNT(*) FROM rec_journal_lines WHERE rec_id=t.id) AS line_count
         FROM rec_journals t LEFT JOIN projects p ON p.id=t.project_id ORDER BY t.active DESC, t.next_due_date")->fetchAll();
     ok(['templates' => $rows]);
+}
+// ── SPA-consumed list endpoints that must be BARE ARRAYS (the SPA does
+//    `await GET('/api/X')||[]` then .map/.find/.reduce). Built against the Python
+//    reference, which returns lists for each of these.
+function api_departments_list(): void {
+    require_auth();
+    try {
+        send(db()->query("SELECT d.*,
+            COALESCE((SELECT SUM(a.amount_ghs) FROM dept_allocations a WHERE a.dept_code=d.dept_code),0)
+            + COALESCE((SELECT SUM(qb.annual_total) FROM quarterly_budgets qb WHERE qb.dept_code=d.dept_code AND COALESCE(qb.is_deleted,0)=0 AND qb.approval_status='Approved'),0) AS total_allocated,
+            COALESCE((SELECT SUM(ac.amount_ghs) FROM actuals ac INNER JOIN projects p ON ac.project_id=p.id WHERE p.division=d.dept_code),0) AS total_spent,
+            COALESCE((SELECT SUM(cm.amount_ghs) FROM commitments cm INNER JOIN projects p2 ON cm.project_id=p2.id WHERE p2.division=d.dept_code),0) AS total_committed,
+            COALESCE((SELECT COUNT(*) FROM projects p WHERE p.division=d.dept_code AND p.status='Active'),0) AS active_grants
+            FROM departments d ORDER BY d.dept_code")->fetchAll());
+    } catch (Throwable $e) {
+        try { send(db()->query("SELECT * FROM departments ORDER BY dept_code")->fetchAll()); } catch (Throwable $e2) { send([]); }
+    }
+}
+function api_fuel_vehicles_list(): void {
+    require_auth();
+    try { send(db()->query("SELECT v.*, p.project_code, p.title AS project_title FROM fuel_vehicles v LEFT JOIN projects p ON p.id=v.project_id ORDER BY v.created_at DESC")->fetchAll()); }
+    catch (Throwable $e) { try { send(db()->query("SELECT * FROM fuel_vehicles")->fetchAll()); } catch (Throwable $e2) { send([]); } }
+}
+function api_attachments_list(): void {
+    require_auth();
+    try {
+        $rid = $_GET['record_id'] ?? null; $mod = $_GET['module'] ?? null;
+        $q = "SELECT id,module,record_id,filename,mime_type,file_size,notes,uploaded_by,uploaded_at FROM document_attachments WHERE 1=1"; $p = [];
+        if ($rid) { $q .= " AND record_id=?"; $p[] = $rid; }
+        if ($mod) { $q .= " AND module=?"; $p[] = $mod; }
+        $q .= " ORDER BY uploaded_at DESC"; $st = db()->prepare($q); $st->execute($p); send($st->fetchAll());
+    } catch (Throwable $e) { send([]); }
+}
+function api_procure_to_pay(): void {
+    require_auth();
+    try {
+        $rows = db()->query("SELECT c.id, c.commit_code, c.commit_date, c.vendor, c.description, c.amount_ghs, c.status,
+            p.project_code, p.title AS project_title, p.division,
+            COALESCE((SELECT SUM(a.amount_ghs) FROM actuals a WHERE a.commitment_id=c.id),0) AS paid_ghs,
+            COALESCE((SELECT COUNT(*) FROM actuals a WHERE a.commitment_id=c.id AND COALESCE(a.is_posted,0)=1),0) AS posted_payments,
+            COALESCE((SELECT COUNT(*) FROM withholding_payables w JOIN actuals a ON a.id=w.actual_id WHERE a.commitment_id=c.id AND w.status='Pending'),0) AS pending_withholdings,
+            COALESCE((SELECT COUNT(*) FROM document_attachments d WHERE d.module='commitments' AND d.record_id=c.id),0) AS docs,
+            COALESCE((SELECT status FROM approvals ap WHERE ap.module='commitments' AND ap.record_id=c.id),'Not Submitted') AS approval_status
+            FROM commitments c JOIN projects p ON p.id=c.project_id ORDER BY c.created_at DESC LIMIT 500")->fetchAll();
+        foreach ($rows as &$r) {
+            $paid = round((float)($r['paid_ghs'] ?? 0), 2); $amt = round((float)($r['amount_ghs'] ?? 0), 2);
+            if ((int)($r['pending_withholdings'] ?? 0) > 0) $r['flow_stage'] = 'Withholding Pending';
+            elseif ($paid >= $amt && $amt > 0) $r['flow_stage'] = 'Paid / Closed';
+            elseif ($paid > 0) $r['flow_stage'] = 'Part-Paid';
+            elseif ((string)($r['approval_status'] ?? '') === 'Approved') $r['flow_stage'] = 'Approved — Awaiting Payment';
+            else $r['flow_stage'] = 'Committed';
+        }
+        unset($r);
+        send($rows);
+    } catch (Throwable $e) { send([]); }
 }
 function api_save_rec_journal(): void {
     ensure_recjv(); $u = require_role(['Admin', 'Finance Officer']); $d = body();
@@ -4029,6 +4087,10 @@ try {
     if ($path === '/api/unbudgeted-spend' && $method === 'GET') api_unbudgeted_spend();
     if ($path === '/api/dashboard' && $method === 'GET') api_dashboard();
     if ($path === '/api/dept-summary' && $method === 'GET') api_dept_summary();
+    if ($path === '/api/departments' && $method === 'GET') api_departments_list();
+    if ($path === '/api/fuel-vehicles' && $method === 'GET') api_fuel_vehicles_list();
+    if ($path === '/api/attachments' && $method === 'GET') api_attachments_list();
+    if ($path === '/api/procure-to-pay' && $method === 'GET') api_procure_to_pay();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
