@@ -4884,7 +4884,8 @@ function gov_last_backup(): ?string {
 function gov_readiness_checks(): array {
     $db = gov_db_info(); $onRender = (bool)getenv('RENDER'); $checks = [];
     $add = function (string $key, string $label, string $status, string $detail, ?string $action = null) use (&$checks) {
-        $checks[] = ['key' => $key, 'label' => $label, 'status' => $status, 'detail' => $detail, 'action' => $action];
+        // 'area' duplicates 'label' so SPA tables that render an AREA column populate it.
+        $checks[] = ['key' => $key, 'area' => $label, 'label' => $label, 'status' => $status, 'detail' => $detail, 'action' => $action];
     };
     $add('persistent_disk', 'Persistent database storage', (!$onRender || strpos($db['path'], '/var/data') === 0) ? 'PASS' : 'FAIL', $db['path'], 'backup-restore');
     $adminHash = (string)gov_scalar("SELECT password_hash FROM users WHERE username='admin' LIMIT 1", [], '');
