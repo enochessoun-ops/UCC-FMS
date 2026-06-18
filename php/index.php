@@ -836,11 +836,17 @@ function reverse_jv(string $jvid, array $u): void {
     $g = db()->prepare('SELECT * FROM general_ledger WHERE jv_id=?'); $g->execute([$jvid]); $rows = $g->fetchAll();
     if (!$rows) return;
     $jq = db()->prepare('SELECT * FROM journal_vouchers WHERE id=?'); $jq->execute([$jvid]); $j = $jq->fetch();
-    $lines = [];
-    foreach ($rows as $r) $lines[] = ['coa_id' => $r['coa_id'], 'debit_amount' => (float)$r['credit_amount'], 'credit_amount' => (float)$r['debit_amount'], 'description' => 'Reversal: ' . ($r['description'] ?? '')];
-    $jdate = (string)($j['jv_date'] ?? date('Y-m-d'));
-    try { post_journal($u, 'RJV', $jdate, substr($jdate, 0, 7), 'Reversal of ' . ($j['jv_number'] ?? ''), $lines, 'reversal', $jvid, $j['unit_id'] ?? null); } catch (Throwable $e) {}
-    if ($j) db()->prepare("UPDATE journal_vouchers SET status='Reversed' WHERE id=?")->execute([$jvid]);
+    ensure_col('journal_vouchers', 'is_reversal', 'INTEGER'); ensure_col('journal_vouchers', 'reversal_of', 'TEXT'); ensure_col('journal_vouchers', 'reversed_by', 'TEXT');
+    // The reversing JV lands on the ORIGINAL date/period and is tagged is_reversal +
+    // reversal_of so it shows in the reversals register and the cash-book net view.
+    $rdate = (string)($j['jv_date'] ?? date('Y-m-d')); $rperiod = (string)($j['period'] ?? substr($rdate, 0, 7));
+    $rid = uuid4(); $rnum = seq_code('journal_vouchers', 'jv_number', 'RJV-' . substr($rperiod, 0, 4) . '-', 4);
+    $tdr = 0.0; $tcr = 0.0; foreach ($rows as $r) { $tdr += money($r['credit_amount']); $tcr += money($r['debit_amount']); }
+    db()->prepare("INSERT INTO journal_vouchers(id,jv_number,jv_type,jv_date,period,description,total_debit,total_credit,status,prepared_by,posted_by,posted_at,is_reversal,reversal_of,source_module,source_id,unit_id) VALUES(?,?,?,?,?,?,?,?,'Posted',?,?,datetime('now'),1,?,?,?,?)")
+        ->execute([$rid, $rnum, 'RJV', $rdate, $rperiod, 'Reversal of ' . ($j['jv_number'] ?? ''), $tdr, $tcr, $u['username'], $u['username'], $jvid, 'reversal', $jvid, $j['unit_id'] ?? null]);
+    $gi = db()->prepare("INSERT INTO general_ledger(id,jv_id,jv_number,jv_line_id,ledger_date,period,coa_id,coa_code,account_name,description,debit_amount,credit_amount,project_id,posted_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    foreach ($rows as $r) { $gi->execute([uuid4(), $rid, $rnum, null, $rdate, $rperiod, $r['coa_id'], $r['coa_code'], $r['account_name'], 'Reversal: ' . (string)($r['description'] ?? ''), money($r['credit_amount']), money($r['debit_amount']), $r['project_id'] ?? null, $u['username'], $r['unit_id'] ?? null]); }
+    if ($j) db()->prepare("UPDATE journal_vouchers SET status='Reversed', reversed_by=? WHERE id=?")->execute([$rid, $jvid]);
 }
 function api_actual_update(): void {
     $u = require_role(['Admin']); $d = body();
@@ -879,7 +885,12 @@ function api_fund_receipt_save(): void {
     foreach (['income_coa_id', 'is_posted', 'jv_id', 'unit_id'] as $c) ensure_col('fund_receipts', $c);
     $d = body();
     if (empty($d['project_id'])) err('project_id is required');
-    if (empty($d['income_coa_id'])) err('income/revenue account (income_coa_id) is required');
+    // Default the income/revenue account to the first revenue (4xxx) account if the
+    // caller didn't specify one (mirrors the Python reference, which auto-classifies).
+    if (empty($d['income_coa_id'])) {
+        $rc = db()->query("SELECT id FROM chart_of_accounts WHERE code LIKE '4%' ORDER BY code LIMIT 1")->fetchColumn();
+        if ($rc) $d['income_coa_id'] = $rc; else err('No revenue (4xxx) account in the chart of accounts');
+    }
     $fx = (float)($d['fx_rate'] ?? 1);
     $fcy = (float)($d['amount_fcy'] ?? 0);
     $id = uuid4();
@@ -893,6 +904,21 @@ function api_fund_receipt_save(): void {
             $d['donor'] ?? 'Internal', $d['description'] ?? 'Receipt', $d['currency'] ?? 'GHS', $fcy, $fx, $fcy * $fx,
             $d['reference_no'] ?? '', $d['receipt_type'] ?? $d['income_type'] ?? 'Grant Receipt',
             $d['income_coa_id'], $u['username'], $unit]);
+    // Fund receipts are actual money received → auto-post to the GL (Dr Bank / Cr Income),
+    // mirroring the Python reference, so the receipt immediately carries a jv_id and shows
+    // in the cash book / statements (and can be reversed).
+    $amt = round($fcy * $fx, 2);
+    $bankc = bank_coa_from_account($d['bank_account_id'] ?? null);
+    if ($amt > 0 && $bankc) {
+        $rdate = (string)($d['receipt_date'] ?? date('Y-m-d'));
+        $lines = [['coa_id' => $bankc, 'debit_amount' => $amt, 'credit_amount' => 0, 'description' => 'Receipt: ' . ($d['donor'] ?? ''), 'project_id' => $d['project_id']],
+                  ['coa_id' => $d['income_coa_id'], 'debit_amount' => 0, 'credit_amount' => $amt, 'description' => 'Income: ' . ($d['description'] ?? ''), 'project_id' => $d['project_id']]];
+        try {
+            [$jid, $jvnum] = post_journal($u, 'RV', $rdate, substr($rdate, 0, 7), 'RV: ' . ($d['donor'] ?? '') . ' — ' . ($d['description'] ?? ''), $lines, 'fund_receipts', $id, $unit);
+            db()->prepare('UPDATE fund_receipts SET is_posted=1, jv_id=? WHERE id=?')->execute([$jid, $id]);
+            ok(['id' => $id, 'receipt_code' => $code, 'jv_number' => $jvnum, 'status' => 'Posted']);
+        } catch (Throwable $e) { /* leave unposted; explicit /post endpoint can retry */ }
+    }
     ok(['id' => $id, 'receipt_code' => $code]);
 }
 function api_fund_receipt_post(): void {
@@ -2121,6 +2147,38 @@ function api_cashbook(): void {
         'hidden_cancelled_lines' => $hidden, 'basis' => 'general_ledger']);
 }
 
+// ── Reversals register + Admin re-date of a posted journal ─────────────────────
+function api_reversals_register(): void {
+    require_auth();
+    ensure_col('journal_vouchers', 'is_reversal', 'INTEGER'); ensure_col('journal_vouchers', 'reversal_of', 'TEXT');
+    $rows = db()->query("SELECT id,jv_number,jv_type,jv_date,period,description,total_debit,total_credit,reversal_of,is_reversal,posted_by,posted_at
+        FROM journal_vouchers WHERE COALESCE(is_reversal,0)=1 ORDER BY jv_date DESC, jv_number DESC")->fetchAll();
+    ok(['reversals' => $rows, 'count' => count($rows)]);
+}
+function api_redate_reversal(): void {
+    $u = require_role(['Admin']); $d = body();
+    $jvn = trim((string)($d['jv_number'] ?? '')); $aid = trim((string)($d['actual_id'] ?? ''));
+    if ($jvn === '' && $aid !== '') {
+        $s = db()->prepare('SELECT jv_id FROM actuals WHERE id=?'); $s->execute([$aid]); $jid0 = $s->fetchColumn();
+        if ($jid0) { $s2 = db()->prepare('SELECT jv_number FROM journal_vouchers WHERE id=?'); $s2->execute([$jid0]); $jvn = (string)$s2->fetchColumn(); }
+    }
+    if ($jvn === '') err('jv_number or actual_id is required');
+    $s = db()->prepare('SELECT * FROM journal_vouchers WHERE jv_number=?'); $s->execute([$jvn]); $jv = $s->fetch();
+    if (!$jv) err('Journal not found');
+    $new_date = substr(trim((string)($d['new_date'] ?? '')), 0, 10);
+    if ($new_date === '' && !empty($jv['reversal_of'])) {
+        $o = db()->prepare('SELECT jv_date FROM journal_vouchers WHERE id=?'); $o->execute([$jv['reversal_of']]); $od = $o->fetchColumn();
+        if ($od) $new_date = substr((string)$od, 0, 10);
+    }
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $new_date)) err('new_date must be YYYY-MM-DD (the corrected transaction date)');
+    $old_period = (string)($jv['period'] ?? '');
+    $new_period = strlen($old_period) === 4 ? substr($new_date, 0, 4) : substr($new_date, 0, 7);
+    db()->prepare('UPDATE journal_vouchers SET jv_date=?, period=? WHERE id=?')->execute([$new_date, $new_period, $jv['id']]);
+    $st = db()->prepare('UPDATE general_ledger SET ledger_date=?, period=? WHERE jv_id=?'); $st->execute([$new_date, $new_period, $jv['id']]);
+    $moved = $st->rowCount();
+    ok(['jv_number' => $jvn, 'new_date' => $new_date, 'new_period' => $new_period, 'ledger_lines_moved' => $moved]);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -2171,6 +2229,8 @@ try {
     if ($path === '/api/finance-overview' && $method === 'GET') api_finance_overview();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
+    if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
+    if ($path === '/api/journals/redate' && $method === 'POST') api_redate_reversal();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
 
