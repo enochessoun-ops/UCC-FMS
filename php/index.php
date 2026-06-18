@@ -1036,17 +1036,115 @@ function api_asset_save(): void {
     $d = body();
     if (empty($d['asset_name'])) err('asset_name is required');
     $cost = (float)($d['acquisition_cost'] ?? 0);
+    $accum = round((float)($d['accumulated_depreciation'] ?? 0), 2);
+    $carry = isset($d['carrying_amount']) ? round((float)$d['carrying_amount'], 2) : round($cost - $accum, 2);
+    $status = $d['status'] ?? 'Active';
     $id = uuid4();
     $code = $d['asset_code'] ?? seq_code('asset_register', 'asset_code', 'AST-', 4);
     require_write_unit($u, $d, 'fixed asset');
     $unit = resolve_write_unit($u, $d);
     db()->prepare("INSERT INTO asset_register(id,asset_code,asset_name,asset_category,acquisition_date,
-        acquisition_cost,useful_life_years,residual_value,accumulated_depreciation,carrying_amount,status,created_by,unit_id)
-        VALUES(?,?,?,?,?,?,?,?,0,?,'Active',?,?)")
+        acquisition_cost,useful_life_years,residual_value,accumulated_depreciation,carrying_amount,asset_coa_id,status,created_by,unit_id)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         ->execute([$id, $code, $d['asset_name'], $d['asset_category'] ?? 'Equipment',
             $d['acquisition_date'] ?? date('Y-m-d'), $cost, (float)($d['useful_life_years'] ?? 0),
-            (float)($d['residual_value'] ?? 0), $cost, $u['username'], $unit]);
+            (float)($d['residual_value'] ?? 0), $accum, $carry, $d['asset_coa_id'] ?? null, $status, $u['username'], $unit]);
     ok(['id' => $id, 'asset_code' => $code]);
+}
+// Find-or-create the chart accounts revaluation/impairment needs (mirror _reval_coa).
+function reval_coa(string $kind): ?string {
+    $find = function (string $sql) { $r = db()->query($sql)->fetchColumn(); return $r ?: null; };
+    $create = function (string $code, string $name, string $cat, string $sub, string $atype) {
+        $n = (int)$code;
+        while (db()->query("SELECT 1 FROM chart_of_accounts WHERE code='" . $n . "'")->fetchColumn()) $n++;
+        $cid = uuid4();
+        db()->prepare("INSERT INTO chart_of_accounts(id,code,category,sub_category,account_name,account_type,vat_applicable) VALUES(?,?,?,?,?,?,0)")
+            ->execute([$cid, (string)$n, $cat, $sub, $name, $atype]);
+        return $cid;
+    };
+    if ($kind === 'surplus') return $find("SELECT id FROM chart_of_accounts WHERE code LIKE '3%' AND LOWER(account_name) LIKE '%revaluation%' ORDER BY code LIMIT 1") ?: $create('31200001', 'Revaluation Surplus', 'Equity', 'Reserves', 'Equity');
+    if ($kind === 'loss') return $find("SELECT id FROM chart_of_accounts WHERE code LIKE '6%' AND LOWER(account_name) LIKE '%impair%' ORDER BY code LIMIT 1") ?: $create('61900031', 'Impairment Loss', 'Expenses', 'Depreciation & Impairment', 'Expense');
+    if ($kind === 'accum_impair') return $find("SELECT id FROM chart_of_accounts WHERE code LIKE '119%' AND LOWER(account_name) LIKE '%impair%' ORDER BY code LIMIT 1") ?: $create('11912001', 'Accumulated Impairment', 'Assets', 'Accumulated Depreciation', 'Asset');
+    return null;
+}
+// Dispose/sell/scrap a fixed asset: Dr Accum.Dep + Dr Bank (proceeds) / Cr Asset
+// cost, balancing gain (42300012) or loss (61700017). Marks the asset Disposed.
+function api_asset_dispose(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $aid = (string)($d['asset_id'] ?? ($d['id'] ?? ''));
+    $st = db()->prepare("SELECT * FROM asset_register WHERE id=?"); $st->execute([$aid]); $a = $st->fetch();
+    if (!$a) err('Asset not found');
+    if (($a['status'] ?? '') === 'Disposed') err('Asset is already disposed');
+    $cost = round((float)($a['acquisition_cost'] ?? 0), 2);
+    $accum = round((float)($a['accumulated_depreciation'] ?? 0), 2);
+    $nbv = round($cost - $accum, 2);
+    $proceeds = round((float)($d['proceeds'] ?? 0), 2);
+    if ($proceeds < 0) err('Proceeds cannot be negative');
+    $cost_coa = $d['cost_coa_id'] ?? null; $accumdep_coa = $d['accumdep_coa_id'] ?? null;
+    if ($cost > 0 && !$cost_coa) err('Select the asset cost account (PPE 111xxxxx) to credit');
+    if ($accum > 0 && !$accumdep_coa) err('Select the accumulated depreciation account (119xxxxx)');
+    $ddate = (string)($d['disposal_date'] ?? date('Y-m-d'));
+    $reason = trim((string)($d['reason'] ?? '')) ?: 'Asset disposal';
+    $gain_coa = db()->query("SELECT id FROM chart_of_accounts WHERE code='42300012'")->fetchColumn()
+        ?: db()->query("SELECT id FROM chart_of_accounts WHERE LOWER(account_name) LIKE '%disposal%' AND code LIKE '4%' ORDER BY code LIMIT 1")->fetchColumn()
+        ?: db()->query("SELECT id FROM chart_of_accounts WHERE (LOWER(account_name) LIKE '%other income%' OR LOWER(account_name) LIKE '%sundry income%') AND code LIKE '4%' ORDER BY code LIMIT 1")->fetchColumn();
+    $loss_coa = db()->query("SELECT id FROM chart_of_accounts WHERE code='61700017'")->fetchColumn()
+        ?: db()->query("SELECT id FROM chart_of_accounts WHERE LOWER(account_name) LIKE '%loss on disposal%' ORDER BY code LIMIT 1")->fetchColumn();
+    $bank_coa = null;
+    if ($proceeds > 0) { $bankId = (string)($d['bank_account_id'] ?? ''); if ($bankId === '') err('Select the bank account receiving the proceeds'); $bank_coa = bank_coa_from_account($bankId); if (!$bank_coa) err('Bank account could not be resolved'); }
+    $gain = round($proceeds + $accum - $cost, 2);
+    $desc = 'Disposal of ' . $a['asset_name'] . ' (' . $a['asset_code'] . ')';
+    $lines = [];
+    if ($accum > 0) $lines[] = ['coa_id' => $accumdep_coa, 'debit_amount' => $accum, 'credit_amount' => 0, 'description' => $desc];
+    if ($proceeds > 0) $lines[] = ['coa_id' => $bank_coa, 'debit_amount' => $proceeds, 'credit_amount' => 0, 'description' => $desc];
+    if ($cost > 0) $lines[] = ['coa_id' => $cost_coa, 'debit_amount' => 0, 'credit_amount' => $cost, 'description' => $desc];
+    if ($gain > 0.005) { if (!$gain_coa) err('Gain/disposal income account (42300012) not found'); $lines[] = ['coa_id' => $gain_coa, 'debit_amount' => 0, 'credit_amount' => $gain, 'description' => 'Gain on disposal of ' . $a['asset_code']]; }
+    elseif ($gain < -0.005) { if (!$loss_coa) err('Loss on disposal account (61700017) not found'); $lines[] = ['coa_id' => $loss_coa, 'debit_amount' => round(-$gain, 2), 'credit_amount' => 0, 'description' => 'Loss on disposal of ' . $a['asset_code']]; }
+    if (!$lines) err('Nothing to post for this asset');
+    try { [$jid, $jvnum] = post_journal($u, 'JV', $ddate, substr($ddate, 0, 7), $desc, $lines, 'asset_disposal', $aid, $a['unit_id'] ?? null); }
+    catch (Throwable $e) { err('Could not post disposal: ' . $e->getMessage()); }
+    db()->prepare("UPDATE asset_register SET status='Disposed', carrying_amount=0, disposal_date=?, disposal_proceeds=?, disposal_reason=?, updated_at=datetime('now') WHERE id=?")
+        ->execute([$ddate, $proceeds, $reason, $aid]);
+    ok(['id' => $aid, 'jv_number' => $jvnum, 'nbv' => $nbv, 'proceeds' => $proceeds, 'gain_loss' => $gain,
+        'message' => sprintf('Asset disposed as %s (%s GHS %.2f)', $jvnum, $gain >= 0 ? 'gain' : 'loss', abs($gain))]);
+}
+// IPSAS 17/21 revaluation (up: Dr cost / Cr Revaluation Surplus) or impairment
+// (down: Dr Impairment Loss / Cr Accumulated Impairment). Updates carrying amount.
+function api_asset_revalue(): void {
+    $u = require_auth(); $d = body();
+    if (($u['role'] ?? '') !== 'Admin') err('Admin access required for revaluation / impairment');
+    $aid = (string)($d['asset_id'] ?? ''); $reason = trim((string)($d['reason'] ?? ''));
+    if ($aid === '') err('asset_id is required');
+    if (strlen($reason) < 5) err('A justification of at least 5 characters is required');
+    if (!is_numeric($d['new_value'] ?? null)) err('new_value must be a number');
+    $new_value = round((float)$d['new_value'], 2); if ($new_value < 0) err('new_value cannot be negative');
+    $vdate = substr((string)($d['valuation_date'] ?? date('Y-m-d')), 0, 10);
+    $st = db()->prepare("SELECT * FROM asset_register WHERE id=?"); $st->execute([$aid]); $a = $st->fetch();
+    if (!$a) err('Asset not found');
+    if (($a['status'] ?? 'Active') !== 'Active') err('Only an Active asset can be revalued (this one is ' . ($a['status'] ?? '') . ')');
+    $nbv = round($a['carrying_amount'] !== null ? (float)$a['carrying_amount'] : ((float)($a['acquisition_cost'] ?? 0) - (float)($a['accumulated_depreciation'] ?? 0)), 2);
+    $delta = round($new_value - $nbv, 2);
+    if (abs($delta) < 0.005) err('New value equals the current carrying amount — nothing to post');
+    if ($delta > 0) {
+        $cost_coa = $a['asset_coa_id'] ?: (db()->query("SELECT id FROM chart_of_accounts WHERE code LIKE '111%' ORDER BY code LIMIT 1")->fetchColumn() ?: null);
+        if (!$cost_coa) err('No PPE cost account (111x) found');
+        $surplus = reval_coa('surplus');
+        $lines = [['coa_id' => $cost_coa, 'debit_amount' => $delta, 'credit_amount' => 0, 'description' => 'Revaluation uplift ' . $a['asset_code']],
+                  ['coa_id' => $surplus, 'debit_amount' => 0, 'credit_amount' => $delta, 'description' => 'Revaluation surplus ' . $a['asset_code']]];
+        $kind = 'Revaluation';
+    } else {
+        $loss = reval_coa('loss'); $accum = reval_coa('accum_impair');
+        $lines = [['coa_id' => $loss, 'debit_amount' => abs($delta), 'credit_amount' => 0, 'description' => 'Impairment loss ' . $a['asset_code']],
+                  ['coa_id' => $accum, 'debit_amount' => 0, 'credit_amount' => abs($delta), 'description' => 'Accumulated impairment ' . $a['asset_code']]];
+        $kind = 'Impairment';
+    }
+    $desc = sprintf('%s of %s (%s): carrying GHS %.2f -> GHS %.2f. %s', $kind, $a['asset_name'], $a['asset_code'], $nbv, $new_value, $reason);
+    try { [$jid, $jvnum] = post_journal($u, 'JV', $vdate, substr($vdate, 0, 7), $desc, $lines, 'asset_revaluation', $aid, $a['unit_id'] ?? null); }
+    catch (Throwable $e) { err('Could not post the ' . strtolower($kind) . ' journal: ' . $e->getMessage()); }
+    if ($delta > 0) db()->prepare("UPDATE asset_register SET carrying_amount=?, revaluation_amount=COALESCE(revaluation_amount,0)+?, last_valuation_date=? WHERE id=?")->execute([$new_value, $delta, $vdate, $aid]);
+    else db()->prepare("UPDATE asset_register SET carrying_amount=?, impairment_amount=COALESCE(impairment_amount,0)+?, last_valuation_date=? WHERE id=?")->execute([$new_value, abs($delta), $vdate, $aid]);
+    ok(['asset_id' => $aid, 'kind' => $kind, 'previous_carrying' => $nbv, 'new_carrying' => $new_value, 'movement' => $delta, 'jv_number' => $jvnum,
+        'message' => sprintf('%s posted as %s (GHS %.2f)', $kind, $jvnum, abs($delta))]);
 }
 function dep_rows(): array {
     $rows = db()->query("SELECT * FROM asset_register WHERE status='Active'")->fetchAll();
@@ -3067,6 +3165,8 @@ try {
     // Phase 3c (assets) — fixed assets + straight-line depreciation
     if ($path === '/api/assets' && $method === 'GET') api_assets_list();
     if ($path === '/api/assets' && $method === 'POST') api_asset_save();
+    if ($path === '/api/assets/dispose' && $method === 'POST') api_asset_dispose();
+    if ($path === '/api/assets/revalue' && $method === 'POST') api_asset_revalue();
     if ($path === '/api/depreciation/schedule' && $method === 'GET') api_depreciation_schedule();
     if ($path === '/api/depreciation/run' && $method === 'POST') api_depreciation_run();
 
