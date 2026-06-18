@@ -2313,6 +2313,78 @@ function api_ppe_schedule(): void {
     ok(['fy' => $fy, 'rows' => $rows, 'totals' => $tot, 'gl_tie' => $gl]);
 }
 
+function api_ipsas24(): void {
+    // IPSAS 24 Statement of Comparison of Budget and Actual Amounts (expenditure
+    // appropriations). Original = final less logged revisions; Final = approved
+    // budget_ghs; Actual = posted PVs in the FY charged to each line, on the same
+    // accrual basis as the I&E. Plus unbudgeted posted spend and the IPSAS 24.47
+    // reconciliation to total general-ledger expenditure.
+    require_auth();
+    $fy = substr((string)($_GET['fy'] ?? date('Y')), 0, 4); $d1 = "$fy-01-01"; $d2 = "$fy-12-31";
+    $haveRev = (bool) db()->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_revisions'")->fetchColumn();
+    $revSub = $haveRev
+        ? "COALESCE((SELECT SUM(br.change_amount_ghs) FROM budget_revisions br WHERE br.budget_id=b.id),0)"
+        : "0";
+    $st = db()->prepare(
+        "SELECT b.id, b.budget_code, COALESCE(c.code,'') AS coa_code, " .
+        "COALESCE(c.account_name, b.budget_code) AS account_name, " .
+        "COALESCE(p.project_code,'') AS project_code, COALESCE(b.budget_ghs,0) AS final_budget, " .
+        $revSub . " AS revised_by, " .
+        "COALESCE((SELECT SUM(a.amount_ghs) FROM actuals a WHERE a.budget_id=b.id " .
+        "AND COALESCE(a.is_posted,0)=1 AND a.expense_date BETWEEN ? AND ?),0) AS actual, " .
+        "COALESCE((SELECT SUM(MAX(0, cm.amount_ghs - COALESCE((SELECT SUM(ax.amount_ghs) " .
+        "FROM actuals ax WHERE ax.commitment_id=cm.id AND COALESCE(ax.is_posted,0)=1),0))) " .
+        "FROM commitments cm WHERE cm.budget_id=b.id " .
+        "AND COALESCE(cm.status,'') NOT IN ('Cancelled','Fully Paid')),0) AS open_commitments " .
+        "FROM budgets b LEFT JOIN chart_of_accounts c ON b.coa_id=c.id " .
+        "LEFT JOIN projects p ON b.project_id=p.id " .
+        "WHERE COALESCE(b.is_deleted,0)=0 " .
+        "AND NOT (COALESCE(c.code,'') LIKE '4%' OR c.category='Revenue' OR c.account_type IN ('Income','Revenue')) " .
+        "ORDER BY coa_code, b.budget_code");
+    $st->execute([$d1, $d2]);
+    $lines = []; $agg = [];
+    foreach ($st->fetchAll() as $r) {
+        $final = round((float)$r['final_budget'], 2);
+        $orig  = round($final - (float)$r['revised_by'], 2);
+        $act   = round((float)$r['actual'], 2);
+        $com   = round((float)$r['open_commitments'], 2);
+        $var   = round($final - $act, 2);
+        $pct   = $final ? round($act / $final * 100, 1) : 0.0;
+        $lines[] = ['budget_code' => $r['budget_code'], 'coa_code' => $r['coa_code'],
+            'account_name' => $r['account_name'], 'project_code' => $r['project_code'],
+            'original' => $orig, 'final' => $final, 'actual' => $act,
+            'open_commitments' => $com, 'variance' => $var, 'utilisation_pct' => $pct];
+        $k = $r['coa_code'] . '|' . $r['account_name'];
+        if (!isset($agg[$k])) $agg[$k] = ['coa_code' => $r['coa_code'], 'account_name' => $r['account_name'],
+            'original' => 0.0, 'final' => 0.0, 'actual' => 0.0, 'open_commitments' => 0.0];
+        $agg[$k]['original'] += $orig; $agg[$k]['final'] += $final;
+        $agg[$k]['actual'] += $act; $agg[$k]['open_commitments'] += $com;
+    }
+    $by_account = [];
+    foreach ($agg as $a) {
+        foreach (['original', 'final', 'actual', 'open_commitments'] as $kk) $a[$kk] = round($a[$kk], 2);
+        $a['variance'] = round($a['final'] - $a['actual'], 2);
+        $a['utilisation_pct'] = $a['final'] ? round($a['actual'] / $a['final'] * 100, 1) : 0.0;
+        $by_account[] = $a;
+    }
+    usort($by_account, fn($x, $y) => strcmp($x['coa_code'] ?: 'zzz', $y['coa_code'] ?: 'zzz'));
+    $ust = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0), COUNT(*) FROM actuals WHERE (budget_id IS NULL OR budget_id='') AND COALESCE(is_posted,0)=1 AND expense_date BETWEEN ? AND ?");
+    $ust->execute([$d1, $d2]); $u = $ust->fetch(PDO::FETCH_NUM);
+    $unbudgeted = ['amount' => round((float)$u[0], 2), 'count' => (int)$u[1]];
+    $gst = db()->prepare("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '6%' AND ledger_date BETWEEN ? AND ?");
+    $gst->execute([$d1, $d2]); $gl_exp = round((float)$gst->fetchColumn(), 2);
+    $sum = fn($k) => round(array_sum(array_map(fn($l) => $l[$k], $lines)), 2);
+    $tot = ['original' => $sum('original'), 'final' => $sum('final'), 'actual' => $sum('actual'), 'open_commitments' => $sum('open_commitments')];
+    $tot['variance'] = round($tot['final'] - $tot['actual'], 2);
+    $tot['utilisation_pct'] = $tot['final'] ? round($tot['actual'] / $tot['final'] * 100, 1) : 0.0;
+    $recon = ['gl_expenditure' => $gl_exp, 'budget_linked_actual' => $tot['actual'],
+        'unbudgeted_actual' => $unbudgeted['amount'],
+        'other_journal_expenditure' => round($gl_exp - $tot['actual'] - $unbudgeted['amount'], 2)];
+    $material = array_values(array_filter($by_account, fn($l) => $l['final'] > 0 && abs($l['variance']) >= max(0.10 * $l['final'], 1.0)));
+    ok(['fy' => $fy, 'lines' => $lines, 'by_account' => $by_account, 'totals' => $tot,
+        'unbudgeted' => $unbudgeted, 'gl_reconciliation' => $recon, 'material_variances' => $material]);
+}
+
 // ── Front controller ────────────────────────────────────────────────────────
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -2366,6 +2438,7 @@ try {
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
     if ($path === '/api/tax-schedules' && $method === 'GET') api_tax_schedules();
     if ($path === '/api/ppe-schedule' && $method === 'GET') api_ppe_schedule();
+    if ($path === '/api/ipsas24' && $method === 'GET') api_ipsas24();
     if ($path === '/api/journals/redate' && $method === 'POST') api_redate_reversal();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
