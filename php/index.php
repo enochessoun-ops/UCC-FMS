@@ -983,14 +983,21 @@ function api_accounting_periods(): void {
 }
 // POST /api/accounting-periods {action: close|open|lock|reopen, period} — period gate.
 function api_accounting_period_action(): void {
-    require_role(['Admin', 'Finance Officer']); $d = body();
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
     $action = strtolower((string)($d['action'] ?? '')); $period = (string)($d['period'] ?? '');
     if ($period === '') err('period is required');
-    $status = ['close' => 'Closed', 'open' => 'Open', 'lock' => 'Locked', 'reopen' => 'Open'][$action] ?? null;
+    // 'create' (the SPA's New Period form) opens a new period, persisting its name/dates.
+    $status = ['create' => 'Open', 'close' => 'Closed', 'open' => 'Open', 'lock' => 'Locked', 'reopen' => 'Open'][$action] ?? null;
     if (!$status) err('Unknown action: ' . $action);
+    $pname = (string)($d['period_name'] ?? $period); $sd = $d['start_date'] ?? null; $ed = $d['end_date'] ?? null;
     $ex = db()->prepare('SELECT id FROM accounting_periods WHERE period=?'); $ex->execute([$period]);
-    if ($ex->fetchColumn()) db()->prepare('UPDATE accounting_periods SET status=? WHERE period=?')->execute([$status, $period]);
-    else db()->prepare('INSERT INTO accounting_periods(id,period,period_name,status,opened_by) VALUES(?,?,?,?,?)')->execute([uuid4(), $period, $period, $status, 'php-port']);
+    if ($ex->fetchColumn()) {
+        if ($action === 'create') err("Period $period already exists");
+        db()->prepare('UPDATE accounting_periods SET status=? WHERE period=?')->execute([$status, $period]);
+    } else {
+        db()->prepare('INSERT INTO accounting_periods(id,period,period_name,status,start_date,end_date,opened_by,opened_at) VALUES(?,?,?,?,?,?,?,datetime(\'now\'))')
+            ->execute([uuid4(), $period, $pname, $status, $sd, $ed, $u['username'] ?? 'php-port']);
+    }
     ok(['period' => $period, 'status' => $status]);
 }
 
@@ -3969,12 +3976,118 @@ function api_bank_account_save(): void {
     $u = require_role(['Admin', 'Finance Officer']); $d = body();
     if (empty($d['account_name']) || empty($d['account_number'])) err('account_name and account_number are required');
     require_write_unit($u, $d, 'bank account');
+    $unit = resolve_write_unit($u, $d); // was dropped — bank scoping needs it stored
+    $eid = !empty($d['id']) ? (string)$d['id'] : null;
+    if ($eid) { $e = db()->prepare('SELECT id FROM bank_accounts WHERE id=?'); $e->execute([$eid]); if (!$e->fetchColumn()) $eid = null; }
+    if ($eid) {
+        db()->prepare("UPDATE bank_accounts SET account_name=?,bank_name=?,branch=?,account_number=?,account_type=?,currency=?,opening_balance=?,unit_id=?,last_amended_by=?,last_amended_at=datetime('now') WHERE id=?")
+            ->execute([$d['account_name'], $d['bank_name'] ?? '', $d['branch'] ?? '', $d['account_number'],
+                $d['account_type'] ?? 'Current', $d['currency'] ?? 'GHS', (float)($d['opening_balance'] ?? 0), $unit, $u['username'], $eid]);
+        ok(['id' => $eid, 'updated' => true]);
+    }
     $id = uuid4();
-    db()->prepare("INSERT INTO bank_accounts(id,account_name,bank_name,branch,account_number,account_type,currency,opening_balance,created_by) VALUES(?,?,?,?,?,?,?,?,?)")
+    db()->prepare("INSERT INTO bank_accounts(id,account_name,bank_name,branch,account_number,account_type,currency,opening_balance,created_by,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?)")
         ->execute([$id, $d['account_name'], $d['bank_name'] ?? '', $d['branch'] ?? '', $d['account_number'],
-            $d['account_type'] ?? 'Current', $d['currency'] ?? 'GHS', (float)($d['opening_balance'] ?? 0), $u['username']]);
+            $d['account_type'] ?? 'Current', $d['currency'] ?? 'GHS', (float)($d['opening_balance'] ?? 0), $u['username'], $unit]);
     ok(['id' => $id]);
 }
+// ── Master-data write endpoints dropped by the PHP port (the gate never exercised
+// these create forms, so they 404'd live). Restored so every SPA form persists. ──
+// POST /api/coa — create/update a chart-of-accounts line.
+function api_coa_save(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body();
+    $code = trim((string)($d['code'] ?? '')); $name = trim((string)($d['account_name'] ?? ($d['name'] ?? '')));
+    if ($code === '' || $name === '') err('code and account_name are required');
+    $cat = (string)($d['category'] ?? ''); $sub = (string)($d['sub_category'] ?? '');
+    $atype = (string)($d['account_type'] ?? ''); $vat = (int)($d['vat_applicable'] ?? 0);
+    $eid = !empty($d['id']) ? (string)$d['id'] : null;
+    if ($eid) {
+        db()->prepare("UPDATE chart_of_accounts SET code=?,account_name=?,category=?,sub_category=?,account_type=?,vat_applicable=? WHERE id=?")
+            ->execute([$code, $name, $cat, $sub, $atype, $vat, $eid]);
+        ok(['id' => $eid, 'updated' => true]);
+    }
+    $ex = db()->prepare("SELECT id FROM chart_of_accounts WHERE code=?"); $ex->execute([$code]);
+    if ($ex->fetchColumn()) err("Account code $code already exists");
+    $id = uuid4();
+    db()->prepare("INSERT INTO chart_of_accounts(id,code,account_name,category,sub_category,account_type,vat_applicable) VALUES(?,?,?,?,?,?,?)")
+        ->execute([$id, $code, $name, $cat, $sub, $atype, $vat]);
+    ok(['id' => $id, 'code' => $code]);
+}
+// POST /api/departments — create/update an ORG UNIT (the tree builder), with parent +
+// cycle validation. Writes org_units (the canonical tree).
+function api_department_save(): void {
+    require_role(['Admin']); $d = body();
+    $code = trim((string)($d['code'] ?? ($d['dept_code'] ?? ''))); $name = trim((string)($d['name'] ?? ($d['dept_name'] ?? '')));
+    if ($code === '' || $name === '') err('code and name are required');
+    $type = (string)($d['unit_type'] ?? ($d['type'] ?? 'Department'));
+    $parent = trim((string)($d['parent_code'] ?? ''));
+    if ($parent !== '' && $parent === $code) err('A unit cannot be its own parent');
+    if ($parent !== '') { $pe = db()->prepare('SELECT 1 FROM org_units WHERE code=?'); $pe->execute([$parent]); if (!$pe->fetchColumn()) err("Parent unit $parent does not exist"); }
+    // Cycle guard: walking up from the chosen parent must never reach this unit.
+    $seen = []; $cur = $parent;
+    while ($cur !== '' && !isset($seen[$cur])) {
+        if ($cur === $code) err('That parent would create a cycle in the tree');
+        $seen[$cur] = true;
+        $pc = db()->prepare('SELECT parent_code FROM org_units WHERE code=?'); $pc->execute([$cur]); $cur = (string)($pc->fetchColumn() ?: '');
+    }
+    $ex = db()->prepare('SELECT id FROM org_units WHERE code=?'); $ex->execute([$code]); $id = $ex->fetchColumn();
+    if ($id) {
+        db()->prepare("UPDATE org_units SET name=?,unit_type=?,parent_code=?,head_name=?,head_title=?,head_email=? WHERE code=?")
+            ->execute([$name, $type, ($parent ?: null), $d['head_name'] ?? '', $d['head_title'] ?? '', $d['head_email'] ?? '', $code]);
+    } else {
+        $id = uuid4();
+        db()->prepare("INSERT INTO org_units(id,code,name,unit_type,parent_code,head_name,head_title,head_email,status,created_at) VALUES(?,?,?,?,?,?,?,?,'Active',datetime('now'))")
+            ->execute([$id, $code, $name, $type, ($parent ?: null), $d['head_name'] ?? '', $d['head_title'] ?? '', $d['head_email'] ?? '']);
+    }
+    ok(['id' => $id, 'code' => $code]);
+}
+// POST /api/fx-rates — record a currency rate.
+function api_exchange_rate_save(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    $ccy = strtoupper(trim((string)($d['currency'] ?? ''))); $rate = (float)($d['rate_to_ghs'] ?? ($d['rate'] ?? 0));
+    if ($ccy === '' || $rate <= 0) err('currency and a positive rate_to_ghs are required');
+    db()->exec("CREATE TABLE IF NOT EXISTS exchange_rates(id TEXT PRIMARY KEY, rate_date TEXT, currency TEXT, rate_to_ghs REAL, source TEXT, entered_by TEXT, created_at TEXT DEFAULT(datetime('now')))");
+    $rdate = (string)($d['rate_date'] ?? date('Y-m-d'));
+    // Upsert by (rate_date, currency) — the table has a unique key, so a same-day re-quote
+    // updates the rate rather than 500-ing on a constraint violation.
+    $ex = db()->prepare("SELECT id FROM exchange_rates WHERE rate_date=? AND currency=?"); $ex->execute([$rdate, $ccy]); $eid = $ex->fetchColumn();
+    if ($eid) {
+        db()->prepare("UPDATE exchange_rates SET rate_to_ghs=?, source=?, entered_by=? WHERE id=?")->execute([$rate, (string)($d['source'] ?? 'Manual'), $u['username'], $eid]);
+        ok(['id' => $eid, 'updated' => true, 'currency' => $ccy, 'rate_to_ghs' => $rate]);
+    }
+    $id = uuid4();
+    db()->prepare("INSERT INTO exchange_rates(id,rate_date,currency,rate_to_ghs,source,entered_by) VALUES(?,?,?,?,?,?)")
+        ->execute([$id, $rdate, $ccy, $rate, (string)($d['source'] ?? 'Manual'), $u['username']]);
+    ok(['id' => $id, 'currency' => $ccy, 'rate_to_ghs' => $rate]);
+}
+// POST /api/quarterly-budgets — create/update a quarterly budget line, unit-tagged.
+function api_quarterly_budget_save(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    require_write_unit($u, $d, 'quarterly budget'); $unit = resolve_write_unit($u, $d);
+    $id = (string)($d['id'] ?? uuid4());
+    $exists = false; if (!empty($d['id'])) { $e = db()->prepare('SELECT 1 FROM quarterly_budgets WHERE id=?'); $e->execute([$id]); $exists = (bool)$e->fetchColumn(); }
+    $vals = [$d['dept_code'] ?? '', $d['academic_year'] ?? '', $d['quarter'] ?? '', $d['coa_id'] ?? null, $d['category'] ?? '', $d['description'] ?? '',
+        (float)($d['q1_amount'] ?? 0), (float)($d['q2_amount'] ?? 0), (float)($d['q3_amount'] ?? 0), (float)($d['q4_amount'] ?? 0),
+        $d['currency'] ?? 'GHS', $d['approval_status'] ?? 'Approved', $d['project_id'] ?? null, $unit];
+    if ($exists) {
+        db()->prepare("UPDATE quarterly_budgets SET dept_code=?,academic_year=?,quarter=?,coa_id=?,category=?,description=?,q1_amount=?,q2_amount=?,q3_amount=?,q4_amount=?,currency=?,approval_status=?,project_id=?,unit_id=? WHERE id=?")
+            ->execute(array_merge($vals, [$id]));
+    } else {
+        db()->prepare("INSERT INTO quarterly_budgets(id,dept_code,academic_year,quarter,coa_id,category,description,q1_amount,q2_amount,q3_amount,q4_amount,currency,approval_status,project_id,unit_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute(array_merge([$id], $vals, [$u['username']]));
+    }
+    ok(['id' => $id]);
+}
+// POST /api/dept-allocations — create a unit allocation, unit-tagged.
+function api_dept_allocation_save(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    require_write_unit($u, $d, 'allocation'); $unit = resolve_write_unit($u, $d);
+    $id = uuid4();
+    db()->prepare("INSERT INTO dept_allocations(id,dept_code,academic_year,semester,allocation_type,amount_ghs,source,approved_by,notes,unit_id) VALUES(?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$id, $d['dept_code'] ?? '', $d['academic_year'] ?? '', $d['semester'] ?? '', $d['allocation_type'] ?? 'Budget', (float)($d['amount_ghs'] ?? 0), $d['source'] ?? '', $u['username'], $d['notes'] ?? '', $unit]);
+    ok(['id' => $id]);
+}
+
 // The seed's users table carries a column-level CHECK limiting role to the three
 // operational roles. Widen it once (preserving all columns/data) so read-only roles
 // like Auditor can be provisioned. Idempotent: skips once 'Auditor' is in the DDL.
@@ -5197,6 +5310,12 @@ try {
 
     // Phase 2 — accounting core
     if ($path === '/api/coa' && $method === 'GET') api_coa();
+    if ($path === '/api/coa' && $method === 'POST') api_coa_save();
+    if ($path === '/api/departments' && $method === 'POST') api_department_save();
+    if ($path === '/api/org-units' && $method === 'POST') api_department_save();
+    if ($path === '/api/fx-rates' && $method === 'POST') api_exchange_rate_save();
+    if ($path === '/api/quarterly-budgets' && $method === 'POST') api_quarterly_budget_save();
+    if ($path === '/api/dept-allocations' && $method === 'POST') api_dept_allocation_save();
     if ($path === '/api/go-live-enforcement/mode' && $method === 'POST') api_golive_mode();
     if ($path === '/api/jvs' && $method === 'GET') api_jvs_list();
     if ($path === '/api/jvs/detail' && $method === 'GET') api_jv_detail();
