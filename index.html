@@ -2346,10 +2346,15 @@ async function openBudgetModal(b=null){
     <div class="fg"><label>Budget (GHS)</label>
       <input id="fb-ghs" readonly style="background:var(--n50);font-weight:600;color:var(--navy)" value="${b?.budget_ghs?fmtGHS(b.budget_ghs):''}">
     </div>
+    <div class="fg"><label>Unit / Cost Centre <span class="req">*</span></label>
+      <select id="fb-orgunit">${typeof _jvUnitOptions==='function'?_jvUnitOptions(b?.unit_id||''):'<option value="">-- Select Unit --</option>'}</select>
+    </div>
     <div class="fg"><label>Notes</label><input id="fb-notes" value="${b?.notes||''}"></div>
   `, async ()=>{
-    const data={id:b?.id,project_id:$('fb-proj').value,coa_id:$('fb-coa').value,currency:$('fb-curr').value,budget_fcy:$('fb-amt').value,fx_rate:$('fb-fx').value,notes:$('fb-notes').value};
+    const _bu=($('fb-orgunit')&&$('fb-orgunit').value)||'';
+    const data={id:b?.id,project_id:$('fb-proj').value,coa_id:$('fb-coa').value,unit_id:_bu,currency:$('fb-curr').value,budget_fcy:$('fb-amt').value,fx_rate:$('fb-fx').value,notes:$('fb-notes').value};
     if(!data.project_id||!data.coa_id||!data.budget_fcy){toast('Fill required fields','error');return;}
+    if(typeof _requireUnit==='function' && !_requireUnit(_bu)){return;}
     const r=await POST('/api/budgets',data);
     if(r?.ok){toast('Budget line saved!','success');closeModal();S.cache.budgets=null;vBudgets();}
     else toast(r?.error||'Error','error');
@@ -10072,7 +10077,7 @@ async function openQBudgetModal(b=null) {
     if(!dept||!desc){toast('Department and description required','error');return;}
     const r = await POST('/api/quarterly-budgets', {
       id: b?.id,
-      dept_code: dept, academic_year: $('qb-year')?.value,
+      dept_code: dept, unit_code: dept, academic_year: $('qb-year')?.value,
       coa_id: $('qb-coa')?.value || null, category: $('qb-cat')?.value,
       description: desc, approved_by: $('qb-appr')?.value,
       currency: $('qb-curr')?.value, notes: $('qb-notes')?.value,

@@ -4124,6 +4124,62 @@ function api_dept_allocation_save(): void {
     ok(['id' => $id]);
 }
 
+// POST /api/attachments — Document Vault upload (was 404; the SPA stores a data-URL).
+function api_attachment_save(): void {
+    $u = require_auth(); $d = body();
+    db()->exec("CREATE TABLE IF NOT EXISTS document_attachments(id TEXT PRIMARY KEY, module TEXT, record_id TEXT, filename TEXT, mime_type TEXT, file_size INTEGER, file_data TEXT, notes TEXT, uploaded_by TEXT, uploaded_at TEXT DEFAULT(datetime('now')))");
+    $fn = trim((string)($d['filename'] ?? '')); if ($fn === '') err('filename is required');
+    $size = (int)($d['file_size'] ?? 0); if ($size > 10 * 1024 * 1024) err('File too large (max 10 MB).');
+    $id = uuid4();
+    db()->prepare("INSERT INTO document_attachments(id,module,record_id,filename,mime_type,file_size,file_data,notes,uploaded_by) VALUES(?,?,?,?,?,?,?,?,?)")
+        ->execute([$id, $d['module'] ?? '', $d['record_id'] ?? '', $fn, $d['mime_type'] ?? '', $size, $d['file_data'] ?? null, $d['notes'] ?? '', $u['username']]);
+    ok(['id' => $id, 'filename' => $fn]);
+}
+function api_attachment_delete(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body(); $id = (string)($d['id'] ?? '');
+    if ($id === '') err('id is required');
+    db()->prepare("DELETE FROM document_attachments WHERE id=?")->execute([$id]);
+    ok(['id' => $id, 'deleted' => true]);
+}
+// POST /api/fuel-vehicles — vehicle registry create/update (was 404). Resolves unit_code
+// to a real unit_id so fuel can roll up the tree. DELETE deactivates.
+function api_fuel_vehicle_save(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body();
+    ensure_col('fuel_vehicles', 'unit_id');
+    $reg = trim((string)($d['registration_number'] ?? '')); if ($reg === '') err('Vehicle registration is required');
+    $uc = (string)($d['unit_code'] ?? ''); $unitId = $uc !== '' ? org_unit_id_of($uc) : null;
+    $eid = !empty($d['id']) ? (string)$d['id'] : null;
+    if ($eid) { $e = db()->prepare('SELECT id FROM fuel_vehicles WHERE id=?'); $e->execute([$eid]); if (!$e->fetchColumn()) $eid = null; }
+    if ($eid) {
+        db()->prepare("UPDATE fuel_vehicles SET registration_number=?,vehicle_name=?,vehicle_type=?,unit_code=?,unit_id=?,project_id=?,driver_name=?,status=?,notes=?,updated_by=?,updated_at=datetime('now') WHERE id=?")
+            ->execute([$reg, $d['vehicle_name'] ?? '', $d['vehicle_type'] ?? 'Vehicle', $uc, $unitId, ($d['project_id'] ?: null), $d['driver_name'] ?? '', $d['status'] ?? 'Active', $d['notes'] ?? '', $u['username'], $eid]);
+        ok(['id' => $eid, 'updated' => true]);
+    }
+    $id = uuid4();
+    db()->prepare("INSERT INTO fuel_vehicles(id,registration_number,vehicle_name,vehicle_type,unit_code,unit_id,project_id,driver_name,status,notes,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+        ->execute([$id, $reg, $d['vehicle_name'] ?? '', $d['vehicle_type'] ?? 'Vehicle', $uc, $unitId, ($d['project_id'] ?: null), $d['driver_name'] ?? '', $d['status'] ?? 'Active', $d['notes'] ?? '', $u['username']]);
+    ok(['id' => $id]);
+}
+function api_fuel_vehicle_delete(string $vid): void {
+    require_role(['Admin', 'Finance Officer']);
+    db()->prepare("UPDATE fuel_vehicles SET status='Inactive', updated_at=datetime('now') WHERE id=?")->execute([$vid]);
+    ok(['id' => $vid, 'message' => 'Vehicle deactivated']);
+}
+// POST /api/budgets/vire — budget virement: move funds between two budget lines (was 404).
+function api_budget_virement(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body();
+    $from = (string)($d['from_id'] ?? ''); $to = (string)($d['to_id'] ?? ''); $amt = money($d['amount'] ?? 0);
+    if ($from === '' || $to === '') err('from_id and to_id are required');
+    if ($from === $to) err('Source and target budget lines must differ');
+    if ($amt <= 0) err('Amount must be positive');
+    $fb = db()->prepare('SELECT budget_code, budget_ghs FROM budgets WHERE id=?'); $fb->execute([$from]); $fr = $fb->fetch(); if (!$fr) err('Source budget line not found');
+    $tb = db()->prepare('SELECT budget_code FROM budgets WHERE id=?'); $tb->execute([$to]); if (!$tb->fetchColumn()) err('Target budget line not found');
+    if ((float)$fr['budget_ghs'] < $amt) err('Insufficient budget on the source line (available ' . number_format((float)$fr['budget_ghs'], 2) . ')');
+    db()->prepare('UPDATE budgets SET budget_ghs=ROUND(budget_ghs-?,2) WHERE id=?')->execute([$amt, $from]);
+    db()->prepare('UPDATE budgets SET budget_ghs=ROUND(budget_ghs+?,2) WHERE id=?')->execute([$amt, $to]);
+    ok(['from_id' => $from, 'to_id' => $to, 'amount' => $amt, 'reason' => $d['reason'] ?? '']);
+}
+
 // The seed's users table carries a column-level CHECK limiting role to the three
 // operational roles. Widen it once (preserving all columns/data) so read-only roles
 // like Auditor can be provisioned. Idempotent: skips once 'Auditor' is in the DDL.
@@ -5358,6 +5414,12 @@ try {
     // Phase 2 — accounting core
     if ($path === '/api/coa' && $method === 'GET') api_coa();
     if ($path === '/api/coa' && $method === 'POST') api_coa_save();
+    if ($path === '/api/attachments' && $method === 'POST') api_attachment_save();
+    if ($path === '/api/document-attachments' && $method === 'POST') api_attachment_save();
+    if (($path === '/api/document-attachments/delete' || $path === '/api/attachments/delete') && $method === 'POST') api_attachment_delete();
+    if ($path === '/api/fuel-vehicles' && $method === 'POST') api_fuel_vehicle_save();
+    if (preg_match('#^/api/fuel-vehicles/([^/]+)$#', $path, $fvm) && $method === 'DELETE') api_fuel_vehicle_delete($fvm[1]);
+    if ($path === '/api/budgets/vire' && $method === 'POST') api_budget_virement();
     if ($path === '/api/departments' && $method === 'POST') api_department_save();
     if ($path === '/api/org-units' && $method === 'POST') api_department_save();
     if ($path === '/api/fx-rates' && $method === 'POST') api_exchange_rate_save();
