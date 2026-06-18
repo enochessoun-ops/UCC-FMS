@@ -4703,17 +4703,37 @@ function api_dashboard(): void {
 // Per-department roll-up the SPA dashboard consumes (returns a BARE ARRAY — the
 // dashboard does depts.reduce(...) over it). Mirror server.py api_dept_summary.
 function api_dept_summary(): void {
-    require_auth();
+    $u = require_auth();
     try {
-        $rows = db()->query("
-            SELECT d.dept_code, d.dept_name, d.head_name,
-              COALESCE((SELECT SUM(a.amount_ghs) FROM dept_allocations a WHERE a.dept_code=d.dept_code),0)
-              + COALESCE((SELECT SUM(qb.annual_total) FROM quarterly_budgets qb WHERE qb.dept_code=d.dept_code AND COALESCE(qb.is_deleted,0)=0 AND qb.approval_status='Approved'),0) AS allocated,
-              COALESCE((SELECT SUM(ac.amount_ghs) FROM actuals ac INNER JOIN projects p ON ac.project_id=p.id WHERE p.division=d.dept_code),0) AS spent,
-              COALESCE((SELECT SUM(cm.amount_ghs) FROM commitments cm INNER JOIN projects p2 ON cm.project_id=p2.id WHERE p2.division=d.dept_code),0) AS committed,
-              COALESCE((SELECT COUNT(*) FROM projects p WHERE p.division=d.dept_code AND p.status='Active'),0) AS active_grants,
-              COALESCE((SELECT SUM(p.budget_ghs) FROM projects p WHERE p.division=d.dept_code),0) AS grant_budget
-            FROM departments d WHERE d.status='Active' ORDER BY d.dept_code")->fetchAll();
+        // Roll up the ORG-UNIT TREE (not the legacy flat departments + projects.division):
+        // each TOP-LEVEL unit (College/Directorate/etc. directly under the root) reports
+        // its whole subtree's budget/spend/commitment via unit_id — the same axis the rest
+        // of the app scopes on, so the dashboard ties to the statements.
+        $units = db()->query("SELECT id,code,name,parent_code,unit_type,head_name FROM org_units")->fetchAll();
+        if (!$units) throw new Exception('no org units');
+        $byParent = [];
+        foreach ($units as $x) { $byParent[(string)($x['parent_code'] ?? '')][] = $x; }
+        $roots = array_values(array_filter($units, fn($x) => empty($x['parent_code'])));
+        $tops = [];
+        foreach ($roots as $r) foreach (($byParent[$r['code']] ?? []) as $ch) $tops[] = $ch;
+        if (!$tops) $tops = $roots; // single-level fallback
+        $scope = resolve_read_scope($u, null); // null = unrestricted; array = allowed ids
+        $rows = [];
+        foreach ($tops as $t) {
+            $ids = org_subtree_ids($t['code']);
+            if ($scope !== null) { $ids = array_values(array_intersect($ids, $scope)); }
+            if (!$ids) continue;
+            $ph = implode(',', array_fill(0, count($ids), '?'));
+            $sum = function (string $sql) use ($ids) { try { $st = db()->prepare($sql); $st->execute($ids); return round((float)($st->fetchColumn() ?: 0), 2); } catch (Throwable $e) { return 0.0; } };
+            $rows[] = [
+                'dept_code' => $t['code'], 'dept_name' => $t['name'], 'head_name' => $t['head_name'] ?? '',
+                'allocated' => $sum("SELECT COALESCE(SUM(budget_ghs),0) FROM budgets WHERE COALESCE(is_deleted,0)=0 AND unit_id IN ($ph)"),
+                'spent' => $sum("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE COALESCE(is_posted,0)=1 AND unit_id IN ($ph)"),
+                'committed' => $sum("SELECT COALESCE(SUM(amount_ghs),0) FROM commitments WHERE COALESCE(status,'') NOT IN ('Cancelled','Fully Paid') AND unit_id IN ($ph)"),
+                'active_grants' => (int)$sum("SELECT COUNT(*) FROM projects WHERE status='Active' AND unit_id IN ($ph)"),
+                'grant_budget' => $sum("SELECT COALESCE(SUM(budget_ghs),0) FROM projects WHERE unit_id IN ($ph)"),
+            ];
+        }
         send($rows);
     } catch (Throwable $e) {
         // Defensive: never break the dashboard render — fall back to a plain dept list.
@@ -4914,8 +4934,14 @@ function api_ipsas24(): void {
     // budget_ghs; Actual = posted PVs in the FY charged to each line, on the same
     // accrual basis as the I&E. Plus unbudgeted posted spend and the IPSAS 24.47
     // reconciliation to total general-ledger expenditure.
-    require_auth();
+    $usr = require_auth();
     $fy = substr((string)($_GET['fy'] ?? date('Y')), 0, 4); $d1 = "$fy-01-01"; $d2 = "$fy-12-31";
+    // Per-unit budget-vs-actual: scope budgets/actuals/GL to the selected node's subtree
+    // (admin/university → unrestricted). Accept unit or unit_code (the SPA sends unit_code).
+    $unitNode = $_GET['unit'] ?? ($_GET['unit_code'] ?? null);
+    [$bw, $bp] = unit_scope_sql($usr, 'b', $unitNode);
+    [$aw, $ap] = unit_scope_sql($usr, 'a', $unitNode);
+    [$gw, $gp] = gl_scope_sql($usr, $unitNode);
     $haveRev = (bool) db()->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_revisions'")->fetchColumn();
     $revSub = $haveRev
         ? "COALESCE((SELECT SUM(br.change_amount_ghs) FROM budget_revisions br WHERE br.budget_id=b.id),0)"
@@ -4935,8 +4961,9 @@ function api_ipsas24(): void {
         "LEFT JOIN projects p ON b.project_id=p.id " .
         "WHERE COALESCE(b.is_deleted,0)=0 " .
         "AND NOT (COALESCE(c.code,'') LIKE '4%' OR c.category='Revenue' OR c.account_type IN ('Income','Revenue')) " .
+        $bw . " " .
         "ORDER BY coa_code, b.budget_code");
-    $st->execute([$d1, $d2]);
+    $st->execute(array_merge([$d1, $d2], $bp));
     $lines = []; $agg = [];
     foreach ($st->fetchAll() as $r) {
         $final = round((float)$r['final_budget'], 2);
@@ -4963,11 +4990,11 @@ function api_ipsas24(): void {
         $by_account[] = $a;
     }
     usort($by_account, fn($x, $y) => strcmp($x['coa_code'] ?: 'zzz', $y['coa_code'] ?: 'zzz'));
-    $ust = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0), COUNT(*) FROM actuals WHERE (budget_id IS NULL OR budget_id='') AND COALESCE(is_posted,0)=1 AND expense_date BETWEEN ? AND ?");
-    $ust->execute([$d1, $d2]); $u = $ust->fetch(PDO::FETCH_NUM);
+    $ust = db()->prepare("SELECT COALESCE(SUM(a.amount_ghs),0), COUNT(*) FROM actuals a WHERE (a.budget_id IS NULL OR a.budget_id='') AND COALESCE(a.is_posted,0)=1 AND a.expense_date BETWEEN ? AND ?$aw");
+    $ust->execute(array_merge([$d1, $d2], $ap)); $u = $ust->fetch(PDO::FETCH_NUM);
     $unbudgeted = ['amount' => round((float)$u[0], 2), 'count' => (int)$u[1]];
-    $gst = db()->prepare("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '6%' AND ledger_date BETWEEN ? AND ?");
-    $gst->execute([$d1, $d2]); $gl_exp = round((float)$gst->fetchColumn(), 2);
+    $gst = db()->prepare("SELECT COALESCE(SUM(COALESCE(gl.debit_amount,0)-COALESCE(gl.credit_amount,0)),0) FROM general_ledger gl WHERE gl.coa_code LIKE '6%' AND gl.ledger_date BETWEEN ? AND ?$gw");
+    $gst->execute(array_merge([$d1, $d2], $gp)); $gl_exp = round((float)$gst->fetchColumn(), 2);
     $sum = fn($k) => round(array_sum(array_map(fn($l) => $l[$k], $lines)), 2);
     $tot = ['original' => $sum('original'), 'final' => $sum('final'), 'actual' => $sum('actual'), 'open_commitments' => $sum('open_commitments')];
     $tot['variance'] = round($tot['final'] - $tot['actual'], 2);
@@ -5066,6 +5093,7 @@ try {
     if ($path === '/api/tax-schedules' && $method === 'GET') api_tax_schedules();
     if ($path === '/api/ppe-schedule' && $method === 'GET') api_ppe_schedule();
     if ($path === '/api/ipsas24' && $method === 'GET') api_ipsas24();
+    if ($path === '/api/budget-variance' && $method === 'GET') api_ipsas24(); // SPA budget-vs-actual screen (was 404); now unit-aware
     if ($path === '/api/journals/redate' && $method === 'POST') api_redate_reversal();
     if ($path === '/api/general-ledger' && $method === 'GET') api_general_ledger();
     if ($path === '/api/accounting-periods' && $method === 'GET') api_accounting_periods();
