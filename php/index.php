@@ -3165,9 +3165,21 @@ function api_finance_overview(): void {
     $overdue = 0; try { $overdue = (int)db()->query("SELECT COUNT(*) FROM ar_invoices WHERE status IN ('Posted','Part-Paid') AND COALESCE(due_date,'') < date('now') AND ROUND(COALESCE(total_ghs,0)-COALESCE(amount_received,0),2)>0.01")->fetchColumn(); } catch (Throwable $e) {}
     $low = 0; try { $low = (int)db()->query("SELECT COUNT(*) FROM inv_items WHERE COALESCE(reorder_level,0)>0 AND COALESCE(qty_on_hand,0) <= reorder_level")->fetchColumn(); } catch (Throwable $e) {}
     $pos = 0; try { $pos = (int)db()->query("SELECT COUNT(*) FROM purchase_orders WHERE COALESCE(status,'')='Received'")->fetchColumn(); } catch (Throwable $e) {}
+    $unb = 0.0; try { $unb = round((float)db()->query("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE (budget_id IS NULL OR budget_id='') AND COALESCE(is_posted,0)=1")->fetchColumn(), 2); } catch (Throwable $e) {}
     ok(['cash' => $cash, 'receivables' => $recv, 'payables' => $pay, 'inventory_value' => $inv,
         'current_assets' => $ca, 'net_working_capital' => $nwc, 'overdue_customers' => $overdue,
-        'low_stock_items' => $low, 'pos_to_bill' => $pos, 'tax_outstanding' => $tax]);
+        'low_stock_items' => $low, 'pos_to_bill' => $pos, 'tax_outstanding' => $tax, 'unbudgeted_total' => $unb]);
+}
+// Reconciliation: posted actuals split into budget-linked vs unbudgeted (sum = total).
+function api_unbudgeted_spend(): void {
+    require_auth();
+    $sc = function (string $where) { try { $st = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE ($where) AND COALESCE(is_posted,0)=1"); $st->execute(); $v = $st->fetchColumn(); return ($v === false || $v === null) ? 0.0 : round((float)$v, 2); } catch (Throwable $e) { return 0.0; } };
+    $total = $sc("1=1"); $linked = $sc("budget_id IS NOT NULL AND budget_id!=''"); $unb = $sc("budget_id IS NULL OR budget_id=''");
+    $ucount = 0; try { $ucount = (int)db()->query("SELECT COUNT(*) FROM actuals WHERE (budget_id IS NULL OR budget_id='') AND COALESCE(is_posted,0)=1")->fetchColumn(); } catch (Throwable $e) {}
+    $items = [];
+    try { foreach (db()->query("SELECT a.actual_code, a.payee, a.description, a.amount_ghs, a.expense_date, p.project_code FROM actuals a LEFT JOIN projects p ON p.id=a.project_id WHERE (a.budget_id IS NULL OR a.budget_id='') AND COALESCE(a.is_posted,0)=1 ORDER BY a.amount_ghs DESC LIMIT 250")->fetchAll() as $r) $items[] = ['code' => $r['actual_code'], 'payee' => $r['payee'], 'description' => $r['description'], 'amount' => round((float)$r['amount_ghs'], 2), 'date' => $r['expense_date'], 'project_code' => $r['project_code']]; } catch (Throwable $e) {}
+    ok(['unbudgeted_total' => $unb, 'unbudgeted_count' => $ucount, 'total_actuals' => $total, 'budget_linked' => $linked,
+        'pct_unbudgeted' => $total ? round($unb / $total * 100, 1) : 0.0, 'items' => $items]);
 }
 function api_financial_integrity(): void {
     require_auth(); $checks = [];
@@ -3464,6 +3476,7 @@ try {
     if ($path === '/api/trends' && $method === 'GET') api_trends();
     if ($path === '/api/consolidation/export' && $method === 'GET') api_consolidation_export();
     if ($path === '/api/finance-overview' && $method === 'GET') api_finance_overview();
+    if ($path === '/api/unbudgeted-spend' && $method === 'GET') api_unbudgeted_spend();
     if ($path === '/api/financial-integrity' && $method === 'GET') api_financial_integrity();
     if ($path === '/api/cashbook' && $method === 'GET') api_cashbook();
     if ($path === '/api/reversals-register' && $method === 'GET') api_reversals_register();
