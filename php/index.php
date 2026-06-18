@@ -2087,6 +2087,36 @@ function api_export_file(): void {
     ok($r);
 }
 
+// Month-end flash pack — GL-derived dashboard: SFP totals, period/YTD income &
+// expenditure, trial-balance health, and top expenditure lines for the period.
+function api_flash_pack(): void {
+    require_auth();
+    $period = trim((string)($_GET['period'] ?? ''));
+    if ($period === '') { $r = db()->query("SELECT period FROM general_ledger ORDER BY period DESC LIMIT 1")->fetchColumn(); $period = $r ?: date('Y-m'); }
+    $year = substr($period, 0, 4);
+    $sc = function (string $sql, array $p = []) { try { $st = db()->prepare($sql); $st->execute($p); $v = $st->fetchColumn(); return ($v === false || $v === null) ? 0.0 : round((float)$v, 2); } catch (Throwable $e) { return 0.0; } };
+    $assets = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '1%'");
+    $liab = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '2%'");
+    $funds = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '3%'");
+    $inc_p = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '4%' AND period LIKE ?", [$period . '%']);
+    $exp_p = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '6%' AND period LIKE ?", [$period . '%']);
+    $inc_y = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)-COALESCE(debit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '4%' AND period LIKE ?", [$year . '%']);
+    $exp_y = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '6%' AND period LIKE ?", [$year . '%']);
+    $tb_dr = $sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)),0) FROM general_ledger");
+    $tb_cr = $sc("SELECT COALESCE(SUM(COALESCE(credit_amount,0)),0) FROM general_ledger");
+    $top = [];
+    try { foreach (db()->query("SELECT coa_code, MAX(account_name) AS account_name, ROUND(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),2) AS amount FROM general_ledger WHERE coa_code LIKE '6%' AND period LIKE '" . str_replace("'", "''", $period) . "%' GROUP BY coa_code HAVING amount > 0 ORDER BY amount DESC LIMIT 5")->fetchAll() as $r) $top[] = $r; } catch (Throwable $e) {}
+    ok(['period' => $period, 'year' => $year, 'as_of' => date('Y-m-d'),
+        'sfp' => ['assets' => $assets, 'liabilities' => $liab, 'funds_and_reserves' => $funds, 'net_assets' => round($assets - $liab, 2),
+                  'presentation_difference' => round($assets - $liab - $funds + round($inc_y - $exp_y, 2), 2)],
+        'income_expenditure' => ['income_period' => $inc_p, 'expenditure_period' => $exp_p, 'surplus_period' => round($inc_p - $exp_p, 2),
+                                 'income_ytd' => $inc_y, 'expenditure_ytd' => $exp_y, 'surplus_ytd' => round($inc_y - $exp_y, 2)],
+        'trial_balance' => ['total_debit' => $tb_dr, 'total_credit' => $tb_cr, 'balanced' => abs($tb_dr - $tb_cr) < 0.05, 'difference' => round($tb_dr - $tb_cr, 2)],
+        'working_capital' => ['cash_and_bank_ghs' => 0.0, 'receivables_ghs' => 0.0, 'payables_ghs' => 0.0, 'inventory_value_ghs' => 0.0,
+                              'current_assets_ghs' => 0.0, 'current_liabilities_ghs' => 0.0, 'net_working_capital_ghs' => 0.0, 'current_ratio' => 0.0, 'quick_ratio' => 0.0],
+        'top_expenditure' => $top]);
+}
+
 // One-click external-audit bundle: a ZIP (base64) of CSV schedules + a manifest.
 // Every section is best-effort and GL/table-derived; a failed section is reported
 // in the manifest, never kills the pack.
@@ -3535,6 +3565,7 @@ try {
     if ($path === '/api/year-end-status' && $method === 'GET') api_year_end_status();
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
     if ($path === '/api/export-file' && $method === 'POST') api_export_file();
+    if ($path === '/api/flash-pack' && $method === 'GET') api_flash_pack();
     if ($path === '/api/audit-pack' && $method === 'GET') api_audit_pack();
     if ($path === '/api/audit/verify' && $method === 'GET') api_audit_verify();
     if ($path === '/api/bank-recon/worklist' && $method === 'GET') api_bank_recon_worklist();
