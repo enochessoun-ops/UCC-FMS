@@ -2390,8 +2390,7 @@ function api_flash_pack(): void {
         'income_expenditure' => ['income_period' => $inc_p, 'expenditure_period' => $exp_p, 'surplus_period' => round($inc_p - $exp_p, 2),
                                  'income_ytd' => $inc_y, 'expenditure_ytd' => $exp_y, 'surplus_ytd' => round($inc_y - $exp_y, 2)],
         'trial_balance' => ['total_debit' => $tb_dr, 'total_credit' => $tb_cr, 'balanced' => abs($tb_dr - $tb_cr) < 0.05, 'difference' => round($tb_dr - $tb_cr, 2)],
-        'working_capital' => ['cash_and_bank_ghs' => 0.0, 'receivables_ghs' => 0.0, 'payables_ghs' => 0.0, 'inventory_value_ghs' => 0.0,
-                              'current_assets_ghs' => 0.0, 'current_liabilities_ghs' => 0.0, 'net_working_capital_ghs' => 0.0, 'current_ratio' => 0.0, 'quick_ratio' => 0.0],
+        'working_capital' => working_capital_data(),
         'top_expenditure' => $top]);
 }
 
@@ -3819,6 +3818,69 @@ function api_finance_overview(): void {
         'current_assets' => $ca, 'net_working_capital' => $nwc, 'overdue_customers' => $overdue,
         'low_stock_items' => $low, 'pos_to_bill' => $pos, 'tax_outstanding' => $tax, 'unbudgeted_total' => $unb]);
 }
+// ── AR/AP aging + working-capital (the Receivables/Payables/Working-Capital views
+//    render degraded without these). Shared helpers so /api/working-capital,
+//    /api/flash-pack and the gate's roll-up all agree. Mirror server.py.
+function ar_aging_data(): array {
+    ensure_arap_tables(); ensure_col('ar_invoices', 'credited_ghs', 'REAL');
+    $rows = db()->query("SELECT i.id,i.invoice_number,i.invoice_date,i.due_date,i.total_ghs,i.amount_received,
+        ROUND(i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0),2) AS balance, c.customer_name, c.customer_code
+        FROM ar_invoices i LEFT JOIN ar_customers c ON c.id=i.customer_id
+        WHERE i.status IN ('Posted','Part-Paid') AND (i.total_ghs - COALESCE(i.amount_received,0) - COALESCE(i.credited_ghs,0)) > 0.01
+        ORDER BY c.customer_name, i.due_date")->fetchAll();
+    $b = ['current' => 0.0, 'b1_30' => 0.0, 'b31_60' => 0.0, 'b61_90' => 0.0, 'b90_plus' => 0.0]; $per = []; $today = time();
+    foreach ($rows as &$r) {
+        $bal = round((float)$r['balance'], 2); $days = 0;
+        if (!empty($r['due_date'])) { $du = strtotime(substr((string)$r['due_date'], 0, 10)); if ($du) $days = (int)floor(($today - $du) / 86400); }
+        $k = $days <= 0 ? 'current' : ($days <= 30 ? 'b1_30' : ($days <= 60 ? 'b31_60' : ($days <= 90 ? 'b61_90' : 'b90_plus')));
+        $b[$k] += $bal; $cust = $r['customer_name'] ?: '—';
+        if (!isset($per[$cust])) $per[$cust] = ['customer' => $cust, 'current' => 0, 'b1_30' => 0, 'b31_60' => 0, 'b61_90' => 0, 'b90_plus' => 0, 'total' => 0];
+        $per[$cust][$k] += $bal; $per[$cust]['total'] += $bal; $r['days_overdue'] = max(0, $days); $r['bucket'] = $k;
+    }
+    unset($r);
+    foreach ($b as $k => $v) $b[$k] = round($v, 2);
+    foreach ($per as &$pc) { foreach ($pc as $k => $v) if ($k !== 'customer') $pc[$k] = round((float)$v, 2); } unset($pc);
+    return ['buckets' => $b, 'by_customer' => array_values($per), 'invoices' => $rows, 'total_outstanding' => round(array_sum($b), 2)];
+}
+function ap_aging_data(): array {
+    ensure_arap_tables(); ensure_col('ap_bills', 'debited_ghs', 'REAL');
+    $rows = db()->query("SELECT b.id,b.bill_number,b.bill_date,b.due_date,b.total_ghs,b.amount_paid,
+        ROUND(b.total_ghs - COALESCE(b.amount_paid,0) - COALESCE(b.debited_ghs,0),2) AS balance, v.vendor_name, v.vendor_code
+        FROM ap_bills b LEFT JOIN vendors v ON v.id=b.vendor_id
+        WHERE b.status IN ('Posted','Part-Paid') AND (b.total_ghs - COALESCE(b.amount_paid,0) - COALESCE(b.debited_ghs,0)) > 0.01
+        ORDER BY v.vendor_name, b.due_date")->fetchAll();
+    $b = ['current' => 0.0, 'b1_30' => 0.0, 'b31_60' => 0.0, 'b61_90' => 0.0, 'b90_plus' => 0.0]; $per = []; $today = time();
+    foreach ($rows as &$r) {
+        $bal = round((float)$r['balance'], 2); $days = 0;
+        if (!empty($r['due_date'])) { $du = strtotime(substr((string)$r['due_date'], 0, 10)); if ($du) $days = (int)floor(($today - $du) / 86400); }
+        $k = $days <= 0 ? 'current' : ($days <= 30 ? 'b1_30' : ($days <= 60 ? 'b31_60' : ($days <= 90 ? 'b61_90' : 'b90_plus')));
+        $b[$k] += $bal; $ven = $r['vendor_name'] ?: '—';
+        if (!isset($per[$ven])) $per[$ven] = ['vendor' => $ven, 'current' => 0, 'b1_30' => 0, 'b31_60' => 0, 'b61_90' => 0, 'b90_plus' => 0, 'total' => 0];
+        $per[$ven][$k] += $bal; $per[$ven]['total'] += $bal; $r['days_overdue'] = max(0, $days); $r['bucket'] = $k;
+    }
+    unset($r);
+    foreach ($b as $k => $v) $b[$k] = round($v, 2);
+    foreach ($per as &$pc) { foreach ($pc as $k => $v) if ($k !== 'vendor') $pc[$k] = round((float)$v, 2); } unset($pc);
+    return ['buckets' => $b, 'by_vendor' => array_values($per), 'bills' => $rows, 'total_outstanding' => round(array_sum($b), 2)];
+}
+function working_capital_data(): array {
+    $ar = ar_aging_data(); $ap = ap_aging_data();
+    $ar_out = round((float)$ar['total_outstanding'], 2); $ap_out = round((float)$ap['total_outstanding'], 2);
+    $arb = $ar['buckets']; $apb = $ap['buckets'];
+    $sc = function ($sql) { try { $v = db()->query($sql)->fetchColumn(); return ($v === false || $v === null) ? 0.0 : (float)$v; } catch (Throwable $e) { return 0.0; } };
+    $cash = round($sc("SELECT COALESCE(SUM(COALESCE(debit_amount,0)-COALESCE(credit_amount,0)),0) FROM general_ledger WHERE coa_code LIKE '126%' OR coa_code LIKE '127%' OR coa_code LIKE '128%' OR coa_code LIKE '129%' OR coa_code='1001' OR coa_id IN (SELECT coa_id FROM bank_accounts WHERE coa_id IS NOT NULL)"), 2);
+    $inv = 0.0; try { ensure_inv_tables(); $inv = round((float)(db()->query("SELECT COALESCE(SUM(COALESCE(qty_on_hand,0)*COALESCE(avg_cost,0)),0) FROM inv_items")->fetchColumn() ?: 0), 2); } catch (Throwable $e) {}
+    $ca = round($cash + $ar_out + $inv, 2); $cl = round($ap_out, 2); $nwc = round($ca - $cl, 2);
+    return ['cash_and_bank_ghs' => $cash, 'receivables_ghs' => $ar_out, 'receivables_overdue_ghs' => round($ar_out - (float)($arb['current'] ?? 0), 2),
+        'payables_ghs' => $ap_out, 'payables_overdue_ghs' => round($ap_out - (float)($apb['current'] ?? 0), 2), 'inventory_value_ghs' => $inv,
+        'current_assets_ghs' => $ca, 'current_liabilities_ghs' => $cl, 'net_working_capital_ghs' => $nwc,
+        'current_ratio' => $cl > 0.005 ? round($ca / $cl, 2) : null, 'quick_ratio' => $cl > 0.005 ? round(($cash + $ar_out) / $cl, 2) : null,
+        'ar_buckets' => $arb, 'ap_buckets' => $apb, 'as_of' => date('Y-m-d')];
+}
+function api_ar_aging(): void { require_auth(); ok(ar_aging_data()); }
+function api_ap_aging(): void { require_auth(); ok(ap_aging_data()); }
+function api_working_capital(): void { require_auth(); ok(working_capital_data()); }
+function api_users_list(): void { require_role(['Admin']); send(db()->query("SELECT id,username,full_name,role,email,active,created_at,home_unit_id,scope FROM users ORDER BY username")->fetchAll()); }
 // Command-centre roll-up. total_committed is the OPEN encumbrance: each live
 // commitment's amount less posted actuals charged to it (mirror server.py).
 function api_dashboard(): void {
@@ -4173,6 +4235,10 @@ try {
     if ($path === '/api/unbudgeted-spend' && $method === 'GET') api_unbudgeted_spend();
     if ($path === '/api/dashboard' && $method === 'GET') api_dashboard();
     if ($path === '/api/dept-summary' && $method === 'GET') api_dept_summary();
+    if ($path === '/api/ar/aging' && $method === 'GET') api_ar_aging();
+    if ($path === '/api/ap/aging' && $method === 'GET') api_ap_aging();
+    if ($path === '/api/working-capital' && $method === 'GET') api_working_capital();
+    if ($path === '/api/users' && $method === 'GET') api_users_list();
     if ($path === '/api/departments' && $method === 'GET') api_departments_list();
     if ($path === '/api/fuel-vehicles' && $method === 'GET') api_fuel_vehicles_list();
     if ($path === '/api/attachments' && $method === 'GET') api_attachments_list();
