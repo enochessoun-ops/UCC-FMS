@@ -1321,6 +1321,14 @@ function gl_date_filter(): array {
     if ($dt) { $w .= ' AND gl.ledger_date<=?'; $p[] = $dt; }
     return [$w, $p];
 }
+// AS-AT filter: a balance sheet (and a cash *balance*) is cumulative to the
+// reporting date — it must include everything up to date_to and IGNORE date_from
+// (otherwise it becomes a period statement and drops prior balances).
+function gl_asat_filter(): array {
+    $dt = $_GET['date_to'] ?? ($_GET['period_to'] ?? null);
+    if ($dt) return [' AND gl.ledger_date<=?', [substr((string)$dt, 0, 10)]];
+    return ['', []];
+}
 function api_income_expenditure(): void {
     $u = require_auth();
     [$w, $p] = gl_date_filter();
@@ -1400,7 +1408,7 @@ function api_year_end_status(): void {
 }
 function api_sfp(): void {
     $u = require_auth();
-    [$w, $p] = gl_date_filter();
+    [$w, $p] = gl_asat_filter();   // balance sheet is cumulative AS-AT date_to
     [$sw, $sp] = gl_scope_sql($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null)); $w .= $sw; $p = array_merge($p, $sp);
     $assets = gl_net_by_type('Asset', $w, $p);
     $liabilities = round(-gl_net_by_type('Liability', $w, $p), 2);
@@ -1432,7 +1440,7 @@ function api_sfp(): void {
 }
 function api_cashflow(): void {
     $u = require_auth();
-    [$w, $p] = gl_date_filter();
+    [$w, $p] = gl_asat_filter();   // closing cash is the cumulative balance AS-AT date_to
     [$sw, $sp] = gl_scope_sql($u, $_GET['unit'] ?? ($_GET['unit_code'] ?? null)); $w .= $sw; $p = array_merge($p, $sp);
     $cashq = db()->prepare("SELECT COALESCE(SUM(gl.debit_amount-gl.credit_amount),0)
         FROM general_ledger gl JOIN chart_of_accounts c ON gl.coa_id=c.id
