@@ -1178,8 +1178,9 @@ function dep_rows(): array {
         $monthly = $life > 0 ? round(($cost - $res) / ($life * 12), 2) : 0.0;
         $remaining = round(max(0.0, ($cost - $res) - $accum), 2);
         if ($monthly > $remaining) $monthly = $remaining;
-        $out[] = ['id' => $r['id'], 'asset_code' => $r['asset_code'], 'cost' => $cost,
-                  'accum' => $accum, 'monthly' => $monthly, 'unit_id' => $r['unit_id'] ?? null];
+        $out[] = ['id' => $r['id'], 'asset_code' => $r['asset_code'], 'asset_name' => $r['asset_name'] ?? '',
+                  'cost' => $cost, 'accum' => $accum, 'accumulated' => round($accum, 2),
+                  'carrying' => round($cost - $accum, 2), 'monthly' => $monthly, 'unit_id' => $r['unit_id'] ?? null];
     }
     return $out;
 }
@@ -2215,6 +2216,32 @@ function api_inv_import(): void {
     }
     ok(['created' => $created, 'received' => $received, 'errors' => array_slice($errors, 0, 40), 'error_count' => count($errors),
         'message' => "Imported $created new item(s) and posted $received stock receipt(s)."]);
+}
+
+// Fuel coupon stock health — the aggregate balance (face value) and the per-
+// denomination available value reconcile by construction (mirror server.py).
+function api_fuel_stock_health(): void {
+    require_auth();
+    $has = fn($t) => (bool)db()->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='" . $t . "'")->fetchColumn();
+    if (!$has('fuel_coupon_batches')) { ok(['calculated_stock_value' => 0.0, 'by_denomination' => []]); }
+    $bcols = array_column(db()->query("PRAGMA table_info(fuel_coupon_batches)")->fetchAll(), 'name');
+    $bw = in_array('is_deleted', $bcols, true) ? "WHERE COALESCE(is_deleted,0)=0" : "";
+    $mvex = $has('fuel_coupon_movements');
+    $mv = function (array $types) use ($mvex) { if (!$mvex) return 0.0; $in = "('" . implode("','", $types) . "')"; return (float)(db()->query("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_movements WHERE movement_type IN $in")->fetchColumn() ?: 0); };
+    $procured = (float)(db()->query("SELECT COALESCE(SUM(face_value),0) FROM fuel_coupon_batches $bw")->fetchColumn() ?: 0);
+    $borrowed = $mv(['Borrow']); $issued = $mv(['Issue']); $lent = $mv(['Lend']);
+    $returned = $mv(['Return', 'Return-Issued', 'Return-Lent']); $returned_borrowed = $mv(['Return-Borrowed']);
+    $balance = round($procured + $borrowed - $issued - $lent + $returned - $returned_borrowed, 2);
+    $byd = [];
+    foreach (db()->query("SELECT denomination, SUM(quantity) AS procured_qty, SUM(face_value) AS procured_value FROM fuel_coupon_batches $bw GROUP BY denomination ORDER BY denomination")->fetchAll() as $r) {
+        $den = (float)$r['denomination']; $out = 0; $inq = 0;
+        if ($mvex) { $m = db()->prepare("SELECT SUM(CASE WHEN movement_type IN ('Issue','Lend','Return-Borrowed') THEN quantity ELSE 0 END) AS o, SUM(CASE WHEN movement_type IN ('Borrow','Return','Return-Issued','Return-Lent') THEN quantity ELSE 0 END) AS i FROM fuel_coupon_movements WHERE denomination=?"); $m->execute([$r['denomination']]); $mm = $m->fetch(); $out = (int)($mm['o'] ?? 0); $inq = (int)($mm['i'] ?? 0); }
+        $avail = (int)($r['procured_qty'] ?? 0) - $out + $inq;
+        $byd[] = ['denomination' => $r['denomination'], 'procured_qty' => (int)($r['procured_qty'] ?? 0), 'out_qty' => $out, 'return_qty' => $inq, 'available_qty' => $avail, 'available_value' => round($avail * $den, 2)];
+    }
+    ok(['calculated_stock_value' => $balance, 'procured_face_value' => round($procured, 2), 'borrowed_value' => round($borrowed, 2),
+        'issued_value' => round($issued, 2), 'lent_value' => round($lent, 2), 'returned_value' => round($returned, 2),
+        'returned_borrowed_value' => round($returned_borrowed, 2), 'by_denomination' => $byd, 'warnings' => []]);
 }
 
 // One-click external-audit bundle: a ZIP (base64) of CSV schedules + a manifest.
@@ -3629,7 +3656,7 @@ try {
     if ($path === '/api/assets' && $method === 'POST') api_asset_save();
     if ($path === '/api/assets/dispose' && $method === 'POST') api_asset_dispose();
     if ($path === '/api/assets/revalue' && $method === 'POST') api_asset_revalue();
-    if ($path === '/api/depreciation/schedule' && $method === 'GET') api_depreciation_schedule();
+    if (($path === '/api/depreciation/schedule' || $path === '/api/depreciation-schedule') && $method === 'GET') api_depreciation_schedule();
     if ($path === '/api/depreciation/run' && $method === 'POST') api_depreciation_run();
 
     // Phase 3d — AR / AP subledgers
@@ -3699,6 +3726,7 @@ try {
     if ($path === '/api/comparative-report' && $method === 'GET') api_comparative_report();
     if ($path === '/api/bank-reconciliation-statement' && $method === 'POST') api_bank_recon_statement_save();
     if ($path === '/api/inv/import' && $method === 'POST') api_inv_import();
+    if ($path === '/api/fuel-stock-health' && $method === 'GET') api_fuel_stock_health();
     if ($path === '/api/audit-pack' && $method === 'GET') api_audit_pack();
     if ($path === '/api/audit/verify' && $method === 'GET') api_audit_verify();
     if ($path === '/api/bank-recon/worklist' && $method === 'GET') api_bank_recon_worklist();
