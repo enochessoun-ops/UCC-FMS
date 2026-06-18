@@ -2117,6 +2117,106 @@ function api_flash_pack(): void {
         'top_expenditure' => $top]);
 }
 
+// FX baseline rates (read) — exchange_rates is seeded; ensure ≥1 baseline exists.
+function api_exchange_rates(): void {
+    require_auth();
+    try {
+        db()->exec("CREATE TABLE IF NOT EXISTS exchange_rates(id TEXT PRIMARY KEY, rate_date TEXT, currency TEXT, rate_to_ghs REAL, source TEXT, entered_by TEXT)");
+        $n = (int)db()->query("SELECT COUNT(*) FROM exchange_rates")->fetchColumn();
+        if ($n === 0) {
+            $ins = db()->prepare("INSERT INTO exchange_rates(id,rate_date,currency,rate_to_ghs,source,entered_by) VALUES(?,?,?,?,?,?)");
+            foreach (['USD' => 15.5, 'GBP' => 19.6, 'EUR' => 16.8] as $ccy => $rt) $ins->execute([uuid4(), date('Y-m-d'), $ccy, $rt, 'Bank of Ghana (baseline)', 'php-port']);
+        }
+        send(db()->query("SELECT * FROM exchange_rates ORDER BY rate_date DESC, currency LIMIT 100")->fetchAll());
+    } catch (Throwable $e) { send([]); }
+}
+// Two-year comparative of income/expenditure/budget (mirror api_comparative_report).
+function api_comparative_report(): void {
+    require_auth();
+    $cy = (int)date('Y');
+    $year1 = (string)($_GET['year1'] ?? ($cy - 1)); $year2 = (string)($_GET['year2'] ?? $cy);
+    $proj = $_GET['project_id'] ?? null;
+    $yd = function (string $yr) use ($proj) {
+        if ($proj) {
+            $e = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE COALESCE(is_posted,0)=1 AND strftime('%Y',expense_date)=? AND project_id=?"); $e->execute([$yr, $proj]);
+            $i = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM fund_receipts WHERE strftime('%Y',receipt_date)=? AND project_id=?"); $i->execute([$yr, $proj]);
+        } else {
+            $e = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM actuals WHERE COALESCE(is_posted,0)=1 AND strftime('%Y',expense_date)=?"); $e->execute([$yr]);
+            $i = db()->prepare("SELECT COALESCE(SUM(amount_ghs),0) FROM fund_receipts WHERE strftime('%Y',receipt_date)=?"); $i->execute([$yr]);
+        }
+        return [round((float)$e->fetchColumn(), 2), round((float)$i->fetchColumn(), 2)];
+    };
+    $bud = function (string $yr) use ($proj) {
+        $cols = array_column(db()->query("PRAGMA table_info(budgets)")->fetchAll(), 'name');
+        $yx = in_array('start_date', $cols, true) ? "strftime('%Y',start_date)" : (in_array('academic_year', $cols, true) ? "substr(academic_year,1,4)" : "strftime('%Y',created_at)");
+        if ($proj) { $s = db()->prepare("SELECT COALESCE(SUM(budget_ghs),0) FROM budgets WHERE $yx=? AND project_id=?"); $s->execute([$yr, $proj]); }
+        else { $s = db()->prepare("SELECT COALESCE(SUM(budget_ghs),0) FROM budgets WHERE $yx=?"); $s->execute([$yr]); }
+        return round((float)$s->fetchColumn(), 2);
+    };
+    [$exp1, $inc1] = $yd($year1); [$exp2, $inc2] = $yd($year2); $b1 = $bud($year1); $b2 = $bud($year2);
+    ok(['year1' => $year1, 'year2' => $year2, 'year1_income' => $inc1, 'year2_income' => $inc2,
+        'year1_expenditure' => $exp1, 'year2_expenditure' => $exp2, 'year1_budget' => $b1, 'year2_budget' => $b2,
+        'year1_surplus' => round($inc1 - $exp1, 2), 'year2_surplus' => round($inc2 - $exp2, 2),
+        'expenditure_change' => round($exp2 - $exp1, 2), 'income_change' => round($inc2 - $inc1, 2)]);
+}
+// Bank reconciliation statement: charges adjust the CASHBOOK side; reconciled when
+// adjusted bank == adjusted cashbook.
+function api_bank_recon_statement_save(): void {
+    require_role(['Admin', 'Finance Officer']); $d = body();
+    if (empty($d['account_id'])) err('Bank account is required');
+    $sb = (float)($d['statement_balance'] ?? 0); $cb = (float)($d['cashbook_balance'] ?? 0);
+    $out = (float)($d['outstanding_cheques'] ?? 0); $unc = (float)($d['uncredited_lodgements'] ?? 0); $chg = (float)($d['bank_charges'] ?? 0);
+    $adj_bank = round($sb - $out + $unc, 2); $adj_book = round($cb - $chg, 2); $diff = round($adj_bank - $adj_book, 2);
+    $rid = $d['id'] ?? uuid4();
+    try {
+        db()->exec("CREATE TABLE IF NOT EXISTS bank_reconciliations(id TEXT PRIMARY KEY, account_id TEXT, recon_date TEXT, statement_balance REAL, cashbook_balance REAL, outstanding_cheques REAL, uncredited_lodgements REAL, bank_charges REAL, recon_difference REAL, status TEXT, created_by TEXT, notes TEXT, created_at TEXT DEFAULT(datetime('now')))");
+        db()->prepare("INSERT OR REPLACE INTO bank_reconciliations(id,account_id,recon_date,statement_balance,cashbook_balance,outstanding_cheques,uncredited_lodgements,bank_charges,recon_difference,status,created_by,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            ->execute([$rid, $d['account_id'], $d['recon_date'] ?? date('Y-m-d'), $sb, $cb, $out, $unc, $chg, $diff, abs($diff) < 0.01 ? 'Reconciled' : 'Exception', (current_user()['username'] ?? 'system'), $d['notes'] ?? null]);
+    } catch (Throwable $e) {}
+    ok(['id' => $rid, 'adjusted_bank_balance' => $adj_bank, 'adjusted_cashbook_balance' => $adj_book,
+        'recon_difference' => $diff, 'status' => abs($diff) < 0.01 ? 'Reconciled' : 'Exception']);
+}
+// Stores bulk import — create items + post stock receipts (Dr Inventory / Cr Bank) from CSV.
+function api_inv_import(): void {
+    $u = require_role(['Admin', 'Finance Officer']); $d = body(); ensure_inv_tables();
+    $bankId = (string)($d['bank_account_id'] ?? ''); if ($bankId === '') err('Select the bank account that paid for the stock');
+    $rows = import_csv_rows($d); if (!$rows) err('No rows found in the uploaded file');
+    $dft = $d['expense_coa_id'] ?? (db()->query("SELECT id FROM chart_of_accounts WHERE code='61300001'")->fetchColumn() ?: (db()->query("SELECT id FROM chart_of_accounts WHERE code LIKE '6%' ORDER BY code LIMIT 1")->fetchColumn() ?: null));
+    $bank = operating_bank_coa(); $invc = inv_asset_coa();
+    $created = 0; $received = 0; $errors = [];
+    foreach ($rows as $i => $r) {
+        $name = trim((string)(pick($r, ['item', 'item_name', 'description', 'name']) ?? ''));
+        if ($name === '') { $errors[] = 'Row ' . ($i + 1) . ': missing item name'; continue; }
+        $qty = imp_num(pick($r, ['qty', 'quantity', 'units', 'qty_received'])); $uc = imp_num(pick($r, ['unit_cost', 'cost', 'price', 'unit_price']));
+        if ($qty <= 0) { $errors[] = 'Row ' . ($i + 1) . " ($name): missing/invalid quantity"; continue; }
+        $iq = db()->prepare("SELECT * FROM inv_items WHERE LOWER(item_name)=?"); $iq->execute([strtolower($name)]); $it = $iq->fetch();
+        if (!$it) {
+            $iid = uuid4(); $code = seq_code('inv_items', 'item_code', 'ITM-', 4);
+            db()->prepare('INSERT INTO inv_items(id,item_code,item_name,category,unit,inventory_coa_id,expense_coa_id,reorder_level,qty_on_hand,avg_cost,created_by) VALUES(?,?,?,?,?,?,?,?,0,0,?)')
+                ->execute([$iid, $code, $name, (pick($r, ['category']) ?: 'General'), (pick($r, ['unit']) ?: 'each'), $invc, $dft, imp_num(pick($r, ['reorder_level', 'reorder'])), $u['username']]);
+            $it = ['id' => $iid, 'item_name' => $name, 'inventory_coa_id' => $invc, 'qty_on_hand' => 0, 'avg_cost' => 0]; $created++;
+        }
+        $total = round($qty * $uc, 2); $jvnum = null;
+        try {
+            if ($total > 0 && $bank) {
+                $inv = $it['inventory_coa_id'] ?: $invc; $date = date('Y-m-d'); $desc = 'Stock receipt: ' . $name . ' x' . $qty;
+                $lines = [['coa_id' => $inv, 'debit_amount' => $total, 'credit_amount' => 0, 'description' => $desc, 'project_id' => null],
+                          ['coa_id' => $bank['id'], 'debit_amount' => 0, 'credit_amount' => $total, 'description' => $desc, 'project_id' => null]];
+                [$jid, $jvnum] = post_journal($u, 'JV', $date, substr($date, 0, 7), $desc, $lines, 'inv_movements', $it['id'], null);
+            }
+            $oldQ = round((float)$it['qty_on_hand'], 3); $newQ = round($oldQ + $qty, 3);
+            $newAvg = $newQ > 0 ? round(($oldQ * (float)$it['avg_cost'] + $qty * $uc) / $newQ, 4) : 0;
+            db()->prepare('UPDATE inv_items SET qty_on_hand=?, avg_cost=? WHERE id=?')->execute([$newQ, $newAvg, $it['id']]);
+            $mnum = seq_code('inv_movements', 'movement_number', 'GRN-', 4);
+            db()->prepare("INSERT INTO inv_movements(id,movement_number,item_id,movement_type,movement_date,qty,unit_cost,total_cost,reference,jv_number,created_by) VALUES(?,?,?,'Receipt',?,?,?,?,?,?,?)")
+                ->execute([uuid4(), $mnum, $it['id'], date('Y-m-d'), $qty, $uc, $total, (pick($r, ['reference', 'grn']) ?: 'Bulk import'), $jvnum, $u['username']]);
+            $received++;
+        } catch (Throwable $e) { $errors[] = 'Row ' . ($i + 1) . " receipt ($name): " . $e->getMessage(); }
+    }
+    ok(['created' => $created, 'received' => $received, 'errors' => array_slice($errors, 0, 40), 'error_count' => count($errors),
+        'message' => "Imported $created new item(s) and posted $received stock receipt(s)."]);
+}
+
 // One-click external-audit bundle: a ZIP (base64) of CSV schedules + a manifest.
 // Every section is best-effort and GL/table-derived; a failed section is reported
 // in the manifest, never kills the pack.
@@ -2421,7 +2521,11 @@ function api_year_end_status(): void {
     require_auth();
     $income = round(-gl_net_by_type('Income'), 2);
     $exp = gl_net_by_type('Expense');
-    send(['ok' => true, 'total_income' => $income, 'total_expenditure' => $exp, 'surplus_deficit' => round($income - $exp, 2)]);
+    $fy = (string)date('Y'); $blockers = [];
+    try { $op = (int)db()->query("SELECT COUNT(*) FROM accounting_periods WHERE SUBSTR(period,1,4)='$fy' AND status!='Closed'")->fetchColumn(); if ($op > 0) $blockers[] = "$op accounting period(s) not yet closed"; } catch (Throwable $e) {}
+    try { $ex = db()->prepare("SELECT 1 FROM year_end_closes WHERE financial_year=?"); $ex->execute([$fy]); if ($ex->fetchColumn()) $blockers[] = 'Year-end close already exists for ' . $fy; } catch (Throwable $e) {}
+    send(['ok' => true, 'financial_year' => $fy, 'total_income' => $income, 'total_expenditure' => $exp,
+        'surplus_deficit' => round($income - $exp, 2), 'is_ready' => count($blockers) === 0, 'blockers' => $blockers]);
 }
 function api_sfp(): void {
     $u = require_auth();
@@ -3591,6 +3695,10 @@ try {
     if ($path === '/api/year-end-close' && $method === 'POST') api_year_end_close();
     if ($path === '/api/export-file' && $method === 'POST') api_export_file();
     if ($path === '/api/flash-pack' && $method === 'GET') api_flash_pack();
+    if ($path === '/api/exchange-rates' && $method === 'GET') api_exchange_rates();
+    if ($path === '/api/comparative-report' && $method === 'GET') api_comparative_report();
+    if ($path === '/api/bank-reconciliation-statement' && $method === 'POST') api_bank_recon_statement_save();
+    if ($path === '/api/inv/import' && $method === 'POST') api_inv_import();
     if ($path === '/api/audit-pack' && $method === 'GET') api_audit_pack();
     if ($path === '/api/audit/verify' && $method === 'GET') api_audit_verify();
     if ($path === '/api/bank-recon/worklist' && $method === 'GET') api_bank_recon_worklist();
